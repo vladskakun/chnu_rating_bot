@@ -21,6 +21,7 @@ URL = (
 
 SPECIALTIES = [
     {
+        "key": "computer_engineering",
         "name": (
             "Комп’ютерна інженерія — програмування мобільних "
             "і вбудованих систем та інтернет речей"
@@ -29,6 +30,7 @@ SPECIALTIES = [
         "search_text": 'ОП "Комп’ютерна інженерія"',
     },
     {
+        "key": "automation",
         "name": (
             "Автоматизація та комп'ютерно-інтегровані технології"
         ),
@@ -39,6 +41,7 @@ SPECIALTIES = [
         ),
     },
     {
+        "key": "electrical_engineering",
         "name": (
             "Електроенергетика, електротехніка "
             "та електромеханіка"
@@ -555,16 +558,42 @@ def analyse_speciality(
 # ============================================================
 
 def analyse_selected_specialities(
-    score: float,
+    scores: float | dict[str, float],
 ) -> list[dict[str, Any]]:
-    """Аналізує програми зі списку SPECIALTIES."""
+    """
+    Аналізує програми зі списку SPECIALTIES.
+
+    Якщо передано число, воно застосовується до всіх програм.
+    Якщо передано словник, для кожної програми використовується
+    окремий бал за її полем key.
+    """
 
     results: list[dict[str, Any]] = []
 
     for speciality in SPECIALTIES:
+        speciality_key = speciality["key"]
+
+        if isinstance(scores, dict):
+            score = scores.get(speciality_key)
+
+            if score is None:
+                results.append(
+                    {
+                        "success": False,
+                        "settings_name": speciality["name"],
+                        "error": (
+                            "Для цієї спеціальності не вказано "
+                            "конкурсний бал."
+                        ),
+                    }
+                )
+                continue
+        else:
+            score = scores
+
         settings = {
             **speciality,
-            "score": score,
+            "score": float(score),
         }
 
         try:

@@ -16,6 +16,7 @@ from aiogram.types import (
 
 from config import BOT_TOKEN
 from rating_parser import (
+    SPECIALTIES,
     analyse_all_specialities,
     analyse_selected_specialities,
     format_all_budget_specialities,
@@ -23,9 +24,11 @@ from rating_parser import (
     parse_user_score,
 )
 from score_history import (
+    ALL_SPECIALITIES_CONTEXT,
     get_recent_scores,
     init_database,
     save_score,
+    speciality_context,
 )
 
 
@@ -59,11 +62,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 def score_history_keyboard(
     scores: list[float],
 ) -> InlineKeyboardMarkup:
-    """
-    Створює кнопки з останніми балами користувача.
-
-    По дві кнопки в рядку, а нижче — введення нового бала.
-    """
+    """Створює кнопки останніх п'яти балів."""
 
     rows: list[list[InlineKeyboardButton]] = []
     current_row: list[InlineKeyboardButton] = []
@@ -85,21 +84,20 @@ def score_history_keyboard(
     if current_row:
         rows.append(current_row)
 
-    rows.append(
+    rows.extend(
         [
-            InlineKeyboardButton(
-                text="✍️ Ввести новий бал",
-                callback_data="score:new",
-            )
-        ]
-    )
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ До головного меню",
-                callback_data="menu:main",
-            )
+            [
+                InlineKeyboardButton(
+                    text="✍️ Ввести новий бал",
+                    callback_data="score:new",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ До головного меню",
+                    callback_data="menu:main",
+                )
+            ],
         ]
     )
 
@@ -135,82 +133,122 @@ async def show_main_menu(
     )
 
 
-async def ask_for_new_score(message: Message) -> None:
-    await message.answer(
-        "Введіть конкурсний бал від 100 до 200.\n"
-        "Наприклад: <b>145.630</b>"
-    )
-
-
-async def run_rating_analysis(
+async def ask_score_for_current_context(
     message: Message,
     state: FSMContext,
     user_id: int,
-    score: float,
 ) -> None:
-    """Запам'ятовує бал і запускає обраний режим аналізу."""
+    """
+    Показує останні 5 балів або просить ввести новий.
+
+    Для обраних спеціальностей кожна ОП має власну історію.
+    """
 
     data = await state.get_data()
     mode = data.get("mode")
 
-    if mode not in {"selected", "all"}:
-        await state.clear()
+    if mode == "selected":
+        index = int(data.get("speciality_index", 0))
 
+        if not 0 <= index < len(SPECIALTIES):
+            await state.clear()
+            await message.answer(
+                "Не вдалося визначити спеціальність.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        speciality = SPECIALTIES[index]
+        context_key = speciality_context(
+            speciality["key"]
+        )
+
+        prompt = (
+            f"<b>{index + 1} із {len(SPECIALTIES)}</b>\n"
+            f"🎓 <b>{speciality['name']}</b>\n\n"
+            "Оберіть попередній бал або введіть "
+            "конкурсний бал саме для цієї спеціальності."
+        )
+
+    elif mode == "all":
+        context_key = ALL_SPECIALITIES_CONTEXT
+
+        prompt = (
+            "Введіть один конкурсний бал для перевірки "
+            "всіх спеціальностей."
+        )
+
+    else:
+        await state.clear()
         await message.answer(
-            "Не вдалося визначити режим аналізу. "
-            "Поверніться до головного меню.",
+            "Не вдалося визначити режим.",
             reply_markup=main_menu_keyboard(),
         )
         return
 
-    await asyncio.to_thread(
-        save_score,
-        user_id,
-        score,
+    await state.update_data(
+        score_context=context_key
     )
 
-    await state.clear()
+    recent_scores = await asyncio.to_thread(
+        get_recent_scores,
+        user_id,
+        context_key,
+    )
 
+    if recent_scores:
+        await state.set_state(
+            RatingStates.choosing_score
+        )
+
+        await message.answer(
+            prompt,
+            reply_markup=score_history_keyboard(
+                recent_scores
+            ),
+        )
+        return
+
+    await state.set_state(
+        RatingStates.waiting_for_score
+    )
+
+    await message.answer(
+        f"{prompt}\n\n"
+        "Введіть число від 100 до 200.\n"
+        "Наприклад: <b>145.630</b>"
+    )
+
+
+async def run_selected_analysis(
+    message: Message,
+    scores_by_speciality: dict[str, float],
+) -> None:
     progress_message = await message.answer(
-        "⏳ Завантажую та аналізую актуальний рейтинг..."
+        "⏳ Аналізую обрані спеціальності "
+        "з окремими балами..."
     )
 
     try:
-        if mode == "selected":
-            results = await asyncio.to_thread(
-                analyse_selected_specialities,
-                score,
+        results = await asyncio.to_thread(
+            analyse_selected_specialities,
+            scores_by_speciality,
+        )
+
+        await progress_message.edit_text(
+            "Готово. Для кожної спеціальності "
+            "використано окремий бал:"
+        )
+
+        for result in results:
+            await message.answer(
+                format_speciality_result(result)
             )
-
-            await progress_message.edit_text(
-                "Готово. Результати за обраними спеціальностями:"
-            )
-
-            for result in results:
-                await message.answer(
-                    format_speciality_result(result)
-                )
-
-        else:
-            analysis = await asyncio.to_thread(
-                analyse_all_specialities,
-                score,
-            )
-
-            messages = format_all_budget_specialities(
-                analysis,
-                score,
-            )
-
-            await progress_message.edit_text(
-                "Готово. Результати перевірки всіх спеціальностей:"
-            )
-
-            for text in messages:
-                await message.answer(text)
 
     except Exception:
-        logging.exception("Помилка під час аналізу рейтингу")
+        logging.exception(
+            "Помилка аналізу обраних спеціальностей"
+        )
 
         await progress_message.edit_text(
             "❌ Під час аналізу сталася помилка. "
@@ -223,13 +261,149 @@ async def run_rating_analysis(
     )
 
 
+async def run_all_analysis(
+    message: Message,
+    score: float,
+) -> None:
+    progress_message = await message.answer(
+        "⏳ Аналізую всі спеціальності..."
+    )
+
+    try:
+        analysis = await asyncio.to_thread(
+            analyse_all_specialities,
+            score,
+        )
+
+        messages = format_all_budget_specialities(
+            analysis,
+            score,
+        )
+
+        await progress_message.edit_text(
+            "Готово. Результати перевірки "
+            "всіх спеціальностей:"
+        )
+
+        for text in messages:
+            await message.answer(text)
+
+    except Exception:
+        logging.exception(
+            "Помилка аналізу всіх спеціальностей"
+        )
+
+        await progress_message.edit_text(
+            "❌ Під час аналізу сталася помилка. "
+            "Спробуйте ще раз трохи пізніше."
+        )
+
+    await message.answer(
+        "Оберіть наступну дію:",
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+
+async def accept_score(
+    message: Message,
+    state: FSMContext,
+    user_id: int,
+    score: float,
+) -> None:
+    """
+    Зберігає бал поточного кроку.
+
+    Для обраних спеціальностей переходить до наступної ОП.
+    Для режиму «Усі» одразу запускає аналіз.
+    """
+
+    data = await state.get_data()
+    mode = data.get("mode")
+    context_key = data.get("score_context")
+
+    if not isinstance(context_key, str):
+        await state.clear()
+        await message.answer(
+            "Не вдалося визначити, для чого зберегти бал.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    await asyncio.to_thread(
+        save_score,
+        user_id,
+        score,
+        context_key,
+    )
+
+    if mode == "all":
+        await state.clear()
+        await run_all_analysis(
+            message,
+            score,
+        )
+        return
+
+    if mode != "selected":
+        await state.clear()
+        await message.answer(
+            "Не вдалося визначити режим.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    index = int(data.get("speciality_index", 0))
+
+    if not 0 <= index < len(SPECIALTIES):
+        await state.clear()
+        await message.answer(
+            "Не вдалося визначити спеціальність.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    speciality = SPECIALTIES[index]
+    selected_scores = dict(
+        data.get("selected_scores", {})
+    )
+
+    selected_scores[
+        speciality["key"]
+    ] = score
+
+    next_index = index + 1
+
+    if next_index < len(SPECIALTIES):
+        await state.update_data(
+            speciality_index=next_index,
+            selected_scores=selected_scores,
+        )
+
+        await ask_score_for_current_context(
+            message,
+            state,
+            user_id,
+        )
+        return
+
+    await state.clear()
+
+    await run_selected_analysis(
+        message,
+        selected_scores,
+    )
+
+
 @router.message(CommandStart())
 @router.message(Command("menu"))
 async def start_handler(
     message: Message,
     state: FSMContext,
 ) -> None:
-    await show_main_menu(message, state)
+    await show_main_menu(
+        message,
+        state,
+    )
 
 
 @router.message(Command("cancel"))
@@ -269,39 +443,32 @@ async def mode_callback(
 ) -> None:
     await callback.answer()
 
-    mode = (
-        "selected"
-        if callback.data == "mode:selected"
-        else "all"
-    )
-
-    await state.set_state(
-        RatingStates.choosing_score
-    )
-    await state.update_data(mode=mode)
-
     if callback.message is None:
         return
 
-    recent_scores = await asyncio.to_thread(
-        get_recent_scores,
+    if callback.data == "mode:selected":
+        await state.set_state(
+            RatingStates.choosing_score
+        )
+        await state.update_data(
+            mode="selected",
+            speciality_index=0,
+            selected_scores={},
+        )
+
+    else:
+        await state.set_state(
+            RatingStates.choosing_score
+        )
+        await state.update_data(
+            mode="all",
+        )
+
+    await ask_score_for_current_context(
+        callback.message,
+        state,
         callback.from_user.id,
     )
-
-    if recent_scores:
-        await callback.message.answer(
-            "Оберіть один з останніх балів "
-            "або введіть новий:",
-            reply_markup=score_history_keyboard(
-                recent_scores
-            ),
-        )
-        return
-
-    await state.set_state(
-        RatingStates.waiting_for_score
-    )
-    await ask_for_new_score(callback.message)
 
 
 @router.callback_query(
@@ -319,7 +486,10 @@ async def new_score_callback(
     )
 
     if callback.message is not None:
-        await ask_for_new_score(callback.message)
+        await callback.message.answer(
+            "Введіть число від 100 до 200.\n"
+            "Наприклад: <b>145.630</b>"
+        )
 
 
 @router.callback_query(
@@ -335,21 +505,21 @@ async def saved_score_callback(
     if callback.data is None:
         return
 
-    raw_score = callback.data.removeprefix("score:")
+    raw_score = callback.data.removeprefix(
+        "score:"
+    )
 
     if raw_score == "new" or not raw_score.isdigit():
         return
 
-    score = int(raw_score) / 1000
-
     if callback.message is None:
         return
 
-    await run_rating_analysis(
+    await accept_score(
         message=callback.message,
         state=state,
         user_id=callback.from_user.id,
-        score=score,
+        score=int(raw_score) / 1000,
     )
 
 
@@ -364,7 +534,9 @@ async def score_handler(
         )
         return
 
-    score = parse_user_score(message.text)
+    score = parse_user_score(
+        message.text
+    )
 
     if score is None:
         await message.answer(
@@ -380,7 +552,7 @@ async def score_handler(
         )
         return
 
-    await run_rating_analysis(
+    await accept_score(
         message=message,
         state=state,
         user_id=message.from_user.id,
@@ -389,7 +561,9 @@ async def score_handler(
 
 
 @router.message()
-async def unknown_message_handler(message: Message) -> None:
+async def unknown_message_handler(
+    message: Message,
+) -> None:
     await message.answer(
         "Скористайтеся командою /start або /menu, "
         "щоб відкрити меню."
@@ -405,7 +579,9 @@ async def main() -> None:
         ),
     )
 
-    await asyncio.to_thread(init_database)
+    await asyncio.to_thread(
+        init_database
+    )
 
     bot = Bot(
         token=BOT_TOKEN,
