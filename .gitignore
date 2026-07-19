@@ -1,0 +1,43 @@
+# Секрети
+.env
+.env.*
+!.env.example
+
+# Локальна SQLite-база та її службові файли
+user_scores.db
+user_scores.db-journal
+user_scores.db-shm
+user_scores.db-wal
+*.sqlite
+*.sqlite3
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Віртуальні середовища
+.venv/
+venv/
+env/
+ENV/
+
+# Результати збірки
+build/
+dist/
+*.egg-info/
+
+# Редактори та ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
