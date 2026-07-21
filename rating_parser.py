@@ -638,14 +638,19 @@ def analyse_selected_specialities(
 
 
 
+
 def tokenize_person_name(text: str) -> list[str]:
     """
-    Розбиває ПІБ на нормалізовані слова.
+    Нормалізує ПІБ для пошуку.
 
-    Дефіси, різні апострофи та регістр не впливають на пошук.
+    Регістр, зайві пробіли, дефіси та різні апострофи
+    не впливають на результат.
     """
 
     normalized = normalize_text(text)
+
+    # Дефіс вважаємо роздільником між словами.
+    normalized = normalized.replace("-", " ")
 
     return re.findall(
         r"[0-9a-zа-яіїєґ']+",
@@ -656,10 +661,7 @@ def tokenize_person_name(text: str) -> list[str]:
 
 def parse_person_query(text: str) -> list[str] | None:
     """
-    Перевіряє пошуковий запит.
-
-    Очікується щонайменше прізвище та ім'я.
-    По батькові можна додавати, але воно не є обов'язковим.
+    Очікує щонайменше два слова: прізвище та ім'я.
     """
 
     tokens = tokenize_person_name(text)
@@ -675,13 +677,14 @@ def person_name_matches(
     query_tokens: list[str],
 ) -> bool:
     """
-    Перевіряє, чи всі слова запиту є окремими словами у ПІБ.
+    Пошук за прізвищем та ім'ям незалежно від їх порядку.
 
-    Завдяки цьому «Іван» не збігається випадково з «Іванна».
+    Використовується точний збіг нормалізованих слів,
+    щоб «Іван» не збігався з «Іванна».
     """
 
-    applicant_tokens = set(
-        tokenize_person_name(applicant_name)
+    applicant_tokens = tokenize_person_name(
+        applicant_name
     )
 
     return all(
@@ -690,17 +693,67 @@ def person_name_matches(
     )
 
 
+def iter_speciality_competition_tables(
+    soup: BeautifulSoup,
+):
+    """
+    Послідовно повертає всі спеціальності та їхні таблиці
+    «зарахування за конкурсом».
+
+    Таблиці квоти 1 і квоти 2 повністю пропускаються.
+    """
+
+    headings = soup.find_all("h4")
+
+    for heading in headings:
+        full_name = heading.get_text(
+            " ",
+            strip=True,
+        )
+
+        # Заголовок має бути схожим на освітню програму.
+        normalized_heading = normalize_text(full_name)
+
+        if "оп " not in normalized_heading and "оп\"" not in normalized_heading:
+            # Додаткова перевірка без залежності від конкретних лапок.
+            if re.search(r"(^|\s)оп(\s|$)", normalized_heading) is None:
+                continue
+
+        competition_table = None
+
+        for element in heading.find_all_next(
+            ["h4", "table"]
+        ):
+            if element.name == "h4":
+                break
+
+            if (
+                element.name == "table"
+                and is_competition_rating_table(element)
+            ):
+                competition_table = element
+                break
+
+        if competition_table is not None:
+            yield {
+                "full_name": full_name,
+                "table": competition_table,
+            }
+
+
 def search_applicant_in_all_ratings(
     person_query: str,
 ) -> dict[str, Any]:
     """
-    Шукає людину в усіх ОП на сторінках ALL_SPECIALTIES_URLS.
+    Шукає вступника у всіх підключених рейтингах.
 
-    Перевіряються лише таблиці «зарахування за конкурсом».
-    Рейтинги за квотою 1 та квотою 2 повністю ігноруються.
+    Пошук відбувається напряму по кожній таблиці загального
+    конкурсу, без повторного пошуку секції за повним заголовком.
     """
 
-    query_tokens = parse_person_query(person_query)
+    query_tokens = parse_person_query(
+        person_query
+    )
 
     if query_tokens is None:
         return {
@@ -712,30 +765,24 @@ def search_applicant_in_all_ratings(
 
     matches: list[dict[str, Any]] = []
     errors: list[str] = []
+    seen: set[tuple[str, int, str]] = set()
 
     for url in ALL_SPECIALTIES_URLS:
         try:
-            soup = get_page(url)
-
-        except requests.RequestException as error:
-            errors.append(f"{url}: {error}")
-            continue
-
-        settings_list = find_all_specialities(
-            soup=soup,
-            url=url,
-            score=100.0,
-        )
-
-        for settings in settings_list:
-            section = find_speciality_section(
-                soup,
-                settings["search_text"],
+            soup = get_page(
+                url,
+                force_refresh=True,
             )
 
-            if section is None or section["table"] is None:
-                continue
+        except requests.RequestException as error:
+            errors.append(
+                f"{url}: {error}"
+            )
+            continue
 
+        for section in iter_speciality_competition_tables(
+            soup
+        ):
             applicants = parse_applicants(
                 section["table"]
             )
@@ -747,21 +794,31 @@ def search_applicant_in_all_ratings(
                 ):
                     continue
 
+                unique_key = (
+                    section["full_name"],
+                    applicant["original_position"],
+                    applicant["name"],
+                )
+
+                if unique_key in seen:
+                    continue
+
+                seen.add(unique_key)
+
                 matches.append(
                     {
                         "full_name": section["full_name"],
-                        "state_seats": parse_state_seats(
-                            section["seats_element"]
-                        ),
-                        "url": url,
-                        **applicant,
+                        "position": applicant[
+                            "original_position"
+                        ],
+                        "name": applicant["name"],
                     }
                 )
 
     matches.sort(
         key=lambda item: (
             normalize_text(item["full_name"]),
-            item["original_position"],
+            item["position"],
         )
     )
 
@@ -968,10 +1025,14 @@ def _pack_html_blocks(
 
 
 
+
 def format_person_search_results(
     analysis: dict[str, Any],
 ) -> list[str]:
-    """Формує Telegram-повідомлення з усіма знайденими заявами."""
+    """
+    Формує короткий результат:
+    назва спеціальності та місце у загальному конкурсі.
+    """
 
     query = _safe(
         analysis.get("query", "")
@@ -986,15 +1047,16 @@ def format_person_search_results(
     matches = analysis["matches"]
 
     header = (
-        "🔎 <b>Пошук у рейтингах за конкурсом</b>\n"
-        f"Запит: <b>{query}</b>\n"
-        "Рейтинги за квотою 1 та квотою 2 не враховуються."
+        "🔎 <b>Результати пошуку</b>\n"
+        f"Пошук: <b>{query}</b>\n\n"
+        "Враховано лише рейтинги "
+        "<b>«зарахування за конкурсом»</b>."
     )
 
     if not matches:
         messages = [
             f"{header}\n\n"
-            "Збігів у підключених рейтингах не знайдено."
+            "У підключених рейтингах збігів не знайдено."
         ]
     else:
         blocks: list[str] = []
@@ -1008,63 +1070,25 @@ def format_person_search_results(
                     match["full_name"]
                 )
             )
-            applicant_name = _safe(
-                match["name"]
-            )
-            features = _safe(
-                match["features"] or "немає"
-            )
-            priority = _safe(
-                match["priority"] or "не вказано"
-            )
-
-            status = (
-                "лише контракт (ПЛ)"
-                if match["contract_only"]
-                else "загальний конкурс"
-            )
-
-            block_lines = [
-                f"<b>{number}. {speciality_name}</b>",
-                f"ПІБ: <b>{applicant_name}</b>",
-                (
-                    "Місце у рейтингу за конкурсом: "
-                    f"<b>{match['original_position']}</b>"
-                ),
-                (
-                    "Рейтинговий бал: "
-                    f"<b>{match['score']:.3f}</b>"
-                ),
-                f"Пріоритет: <b>{priority}</b>",
-                f"Статус заяви: <b>{status}</b>",
-                f"Пільги та особливості: {features}",
-            ]
-
-            if match["confirmed_place"]:
-                block_lines.append(
-                    "ПМН: "
-                    f"<b>{_safe(match['confirmed_place'])}</b>"
-                )
 
             blocks.append(
-                "\n".join(block_lines)
+                f"<b>{number}. {speciality_name}</b>\n"
+                f"Місце в рейтингу: "
+                f"<b>{match['position']}</b>"
             )
 
         messages = _pack_html_blocks(
             (
                 f"{header}\n"
-                f"Знайдено заяв: <b>{len(matches)}</b>"
+                f"Знайдено рейтингів: "
+                f"<b>{len(matches)}</b>"
             ),
             blocks,
         )
 
     if analysis["errors"]:
         messages.append(
-            "⚠️ <b>Не вдалося перевірити деякі сторінки</b>\n"
-            + "\n".join(
-                f"• {_safe(error)}"
-                for error in analysis["errors"]
-            )
+            "⚠️ Не вдалося перевірити деякі сторінки."
         )
 
     return messages
