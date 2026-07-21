@@ -186,11 +186,37 @@ def is_contract_only(features: str) -> bool:
 # ПОШУК СПЕЦІАЛЬНОСТЕЙ І КІЛЬКОСТІ МІСЦЬ
 # ============================================================
 
+def is_competition_rating_table(table: Any) -> bool:
+    """
+    Перевіряє, що таблиця належить саме до загального конкурсу.
+
+    Таблиці «зарахування за квотою 1/2» навмисно
+    не використовуються ні для прогнозу, ні для пошуку.
+    """
+
+    if table is None:
+        return False
+
+    table_text = normalize_text(
+        table.get_text(" ", strip=True)
+    )
+
+    return (
+        "рейтинговий список абітурієнтів" in table_text
+        and "зарахування за конкурсом" in table_text
+    )
+
+
 def find_speciality_section(
     soup: BeautifulSoup,
     search_text: str,
 ) -> dict[str, Any] | None:
-    """Знаходить заголовок, держмісця та рейтингову таблицю."""
+    """
+    Знаходить заголовок, держмісця та таблицю загального конкурсу.
+
+    Якщо перед загальним конкурсом розміщені таблиці квоти 1
+    або квоти 2, вони пропускаються.
+    """
 
     normalized_search = normalize_text(search_text)
 
@@ -217,18 +243,12 @@ def find_speciality_section(
 
                 continue
 
-            if element.name == "table":
-                table_text = normalize_text(
-                    element.get_text(" ", strip=True)
-                )
-
-                if (
-                    "рейтинг" in table_text
-                    and "бал" in table_text
-                    and "прізвище" in table_text
-                ):
-                    rating_table = element
-                    break
+            if (
+                element.name == "table"
+                and is_competition_rating_table(element)
+            ):
+                rating_table = element
+                break
 
         return {
             "full_name": heading_text,
@@ -295,7 +315,7 @@ def parse_state_seats(seats_element: Any) -> int | None:
 # ============================================================
 
 def parse_applicants(table: Any) -> list[dict[str, Any]]:
-    """Зчитує всіх вступників із рейтингової таблиці."""
+    """Зчитує всіх вступників із таблиці загального конкурсу."""
 
     applicants: list[dict[str, Any]] = []
 
@@ -323,7 +343,9 @@ def parse_applicants(table: Any) -> list[dict[str, Any]]:
         if score is None:
             continue
 
-        features = " ".join(values[3:]) if len(values) >= 4 else ""
+        features = values[3] if len(values) >= 4 else ""
+        confirmed_place = values[4] if len(values) >= 5 else ""
+        priority = values[5] if len(values) >= 6 else ""
 
         applicants.append(
             {
@@ -331,6 +353,8 @@ def parse_applicants(table: Any) -> list[dict[str, Any]]:
                 "name": values[1],
                 "score": score,
                 "features": features,
+                "confirmed_place": confirmed_place,
+                "priority": priority,
                 "contract_only": is_contract_only(features),
             }
         )
@@ -612,6 +636,143 @@ def analyse_selected_specialities(
     return results
 
 
+
+
+def tokenize_person_name(text: str) -> list[str]:
+    """
+    Розбиває ПІБ на нормалізовані слова.
+
+    Дефіси, різні апострофи та регістр не впливають на пошук.
+    """
+
+    normalized = normalize_text(text)
+
+    return re.findall(
+        r"[0-9a-zа-яіїєґ']+",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+
+def parse_person_query(text: str) -> list[str] | None:
+    """
+    Перевіряє пошуковий запит.
+
+    Очікується щонайменше прізвище та ім'я.
+    По батькові можна додавати, але воно не є обов'язковим.
+    """
+
+    tokens = tokenize_person_name(text)
+
+    if len(tokens) < 2:
+        return None
+
+    return tokens
+
+
+def person_name_matches(
+    applicant_name: str,
+    query_tokens: list[str],
+) -> bool:
+    """
+    Перевіряє, чи всі слова запиту є окремими словами у ПІБ.
+
+    Завдяки цьому «Іван» не збігається випадково з «Іванна».
+    """
+
+    applicant_tokens = set(
+        tokenize_person_name(applicant_name)
+    )
+
+    return all(
+        token in applicant_tokens
+        for token in query_tokens
+    )
+
+
+def search_applicant_in_all_ratings(
+    person_query: str,
+) -> dict[str, Any]:
+    """
+    Шукає людину в усіх ОП на сторінках ALL_SPECIALTIES_URLS.
+
+    Перевіряються лише таблиці «зарахування за конкурсом».
+    Рейтинги за квотою 1 та квотою 2 повністю ігноруються.
+    """
+
+    query_tokens = parse_person_query(person_query)
+
+    if query_tokens is None:
+        return {
+            "query": person_query,
+            "matches": [],
+            "errors": [],
+            "invalid_query": True,
+        }
+
+    matches: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    for url in ALL_SPECIALTIES_URLS:
+        try:
+            soup = get_page(url)
+
+        except requests.RequestException as error:
+            errors.append(f"{url}: {error}")
+            continue
+
+        settings_list = find_all_specialities(
+            soup=soup,
+            url=url,
+            score=100.0,
+        )
+
+        for settings in settings_list:
+            section = find_speciality_section(
+                soup,
+                settings["search_text"],
+            )
+
+            if section is None or section["table"] is None:
+                continue
+
+            applicants = parse_applicants(
+                section["table"]
+            )
+
+            for applicant in applicants:
+                if not person_name_matches(
+                    applicant["name"],
+                    query_tokens,
+                ):
+                    continue
+
+                matches.append(
+                    {
+                        "full_name": section["full_name"],
+                        "state_seats": parse_state_seats(
+                            section["seats_element"]
+                        ),
+                        "url": url,
+                        **applicant,
+                    }
+                )
+
+    matches.sort(
+        key=lambda item: (
+            normalize_text(item["full_name"]),
+            item["original_position"],
+        )
+    )
+
+    return {
+        "query": person_query.strip(),
+        "matches": matches,
+        "errors": errors,
+        "invalid_query": False,
+    }
+
+
 def analyse_all_specialities(
     score: float,
 ) -> dict[str, Any]:
@@ -801,6 +962,110 @@ def _pack_html_blocks(
 
     if current:
         messages.append(current)
+
+    return messages
+
+
+
+
+def format_person_search_results(
+    analysis: dict[str, Any],
+) -> list[str]:
+    """Формує Telegram-повідомлення з усіма знайденими заявами."""
+
+    query = _safe(
+        analysis.get("query", "")
+    )
+
+    if analysis.get("invalid_query"):
+        return [
+            "❌ Введіть щонайменше прізвище та ім’я.\n"
+            "Наприклад: <b>Савчук Роман</b>"
+        ]
+
+    matches = analysis["matches"]
+
+    header = (
+        "🔎 <b>Пошук у рейтингах за конкурсом</b>\n"
+        f"Запит: <b>{query}</b>\n"
+        "Рейтинги за квотою 1 та квотою 2 не враховуються."
+    )
+
+    if not matches:
+        messages = [
+            f"{header}\n\n"
+            "Збігів у підключених рейтингах не знайдено."
+        ]
+    else:
+        blocks: list[str] = []
+
+        for number, match in enumerate(
+            matches,
+            start=1,
+        ):
+            speciality_name = _safe(
+                get_short_speciality_name(
+                    match["full_name"]
+                )
+            )
+            applicant_name = _safe(
+                match["name"]
+            )
+            features = _safe(
+                match["features"] or "немає"
+            )
+            priority = _safe(
+                match["priority"] or "не вказано"
+            )
+
+            status = (
+                "лише контракт (ПЛ)"
+                if match["contract_only"]
+                else "загальний конкурс"
+            )
+
+            block_lines = [
+                f"<b>{number}. {speciality_name}</b>",
+                f"ПІБ: <b>{applicant_name}</b>",
+                (
+                    "Місце у рейтингу за конкурсом: "
+                    f"<b>{match['original_position']}</b>"
+                ),
+                (
+                    "Рейтинговий бал: "
+                    f"<b>{match['score']:.3f}</b>"
+                ),
+                f"Пріоритет: <b>{priority}</b>",
+                f"Статус заяви: <b>{status}</b>",
+                f"Пільги та особливості: {features}",
+            ]
+
+            if match["confirmed_place"]:
+                block_lines.append(
+                    "ПМН: "
+                    f"<b>{_safe(match['confirmed_place'])}</b>"
+                )
+
+            blocks.append(
+                "\n".join(block_lines)
+            )
+
+        messages = _pack_html_blocks(
+            (
+                f"{header}\n"
+                f"Знайдено заяв: <b>{len(matches)}</b>"
+            ),
+            blocks,
+        )
+
+    if analysis["errors"]:
+        messages.append(
+            "⚠️ <b>Не вдалося перевірити деякі сторінки</b>\n"
+            + "\n".join(
+                f"• {_safe(error)}"
+                for error in analysis["errors"]
+            )
+        )
 
     return messages
 

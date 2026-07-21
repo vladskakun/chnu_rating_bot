@@ -20,8 +20,11 @@ from rating_parser import (
     analyse_all_specialities,
     analyse_selected_specialities,
     format_all_budget_specialities,
+    format_person_search_results,
     format_speciality_result,
+    parse_person_query,
     parse_user_score,
+    search_applicant_in_all_ratings,
 )
 from score_history import (
     ALL_SPECIALITIES_CONTEXT,
@@ -38,6 +41,7 @@ router = Router()
 class RatingStates(StatesGroup):
     choosing_score = State()
     waiting_for_score = State()
+    waiting_for_name = State()
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -53,6 +57,12 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="2. Усі спеціальності",
                     callback_data="mode:all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="3. Знайти себе у всіх рейтингах",
+                    callback_data="mode:search",
                 )
             ],
         ]
@@ -432,6 +442,88 @@ async def menu_callback(
             "Оберіть режим:",
             reply_markup=main_menu_keyboard(),
         )
+
+
+
+
+@router.callback_query(F.data == "mode:search")
+async def search_mode_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await callback.answer()
+    await state.clear()
+    await state.set_state(
+        RatingStates.waiting_for_name
+    )
+
+    if callback.message is not None:
+        await callback.message.answer(
+            "Введіть <b>прізвище та ім’я</b>.\n"
+            "По батькові можна не вказувати.\n\n"
+            "Наприклад: <b>Савчук Роман</b>\n\n"
+            "Пошук відбувається лише у списках "
+            "«зарахування за конкурсом». "
+            "Квота 1 та квота 2 ігноруються."
+        )
+
+
+@router.message(RatingStates.waiting_for_name)
+async def person_name_handler(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if message.text is None:
+        await message.answer(
+            "Надішліть прізвище та ім’я текстом."
+        )
+        return
+
+    if parse_person_query(message.text) is None:
+        await message.answer(
+            "Введіть щонайменше два слова: "
+            "прізвище та ім’я.\n"
+            "Наприклад: <b>Савчук Роман</b>"
+        )
+        return
+
+    await state.clear()
+
+    progress_message = await message.answer(
+        "⏳ Шукаю у всіх підключених рейтингах..."
+    )
+
+    try:
+        analysis = await asyncio.to_thread(
+            search_applicant_in_all_ratings,
+            message.text,
+        )
+
+        result_messages = format_person_search_results(
+            analysis
+        )
+
+        await progress_message.edit_text(
+            "Готово. Пошук завершено."
+        )
+
+        for text in result_messages:
+            await message.answer(text)
+
+    except Exception:
+        logging.exception(
+            "Помилка пошуку вступника"
+        )
+
+        await progress_message.edit_text(
+            "❌ Під час пошуку сталася помилка. "
+            "Спробуйте ще раз трохи пізніше."
+        )
+
+    await message.answer(
+        "Оберіть наступну дію:",
+        reply_markup=back_to_menu_keyboard(),
+    )
 
 
 @router.callback_query(
