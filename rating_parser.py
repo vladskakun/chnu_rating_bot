@@ -1582,13 +1582,19 @@ def format_person_search_results(
     return messages
 
 
+
 def format_all_budget_specialities(
     analysis: dict[str, Any],
 ) -> list[str]:
     """
-    Формує ОП, де користувач проходить або перебуває на межі.
+    Формує результат для ВСІХ проаналізованих програм.
 
-    Кожний результат уже містить власний конкурсний бал.
+    Програми поділяються на:
+    - проходиш на бюджет;
+    - перебуваєш на межі;
+    - не проходиш за поточним рейтингом.
+
+    Назву функції залишено старою для сумісності з bot.py.
     """
 
     results = analysis["results"]
@@ -1605,94 +1611,292 @@ def format_all_budget_specialities(
         if get_budget_category(result) == "border"
     ]
 
-    definite.sort(key=lambda result: result["best_place"])
-    border.sort(key=lambda result: result["best_place"])
+    outside = [
+        result
+        for result in results
+        if get_budget_category(result) == "outside"
+    ]
 
-    messages: list[str] = []
+    unknown = [
+        result
+        for result in results
+        if get_budget_category(result) == "unknown"
+    ]
 
-    header = (
-        "✅ <b>Спеціальності, де ви проходите "
-        "на державне замовлення</b>\n"
-        "Для кожної програми використано окремий бал."
+    definite.sort(
+        key=lambda result: (
+            result["best_place"],
+            normalize_text(result["full_name"]),
+        )
     )
 
-    if definite:
-        blocks = []
+    border.sort(
+        key=lambda result: (
+            result["best_place"],
+            normalize_text(result["full_name"]),
+        )
+    )
 
-        for number, result in enumerate(definite, start=1):
-            short_name = _safe(
-                get_short_speciality_name(result["full_name"])
+    outside.sort(
+        key=lambda result: (
+            result["best_place"],
+            normalize_text(result["full_name"]),
+        )
+    )
+
+    unknown.sort(
+        key=lambda result: normalize_text(
+            result.get(
+                "full_name",
+                result.get(
+                    "settings_name",
+                    "",
+                ),
+            )
+        )
+    )
+
+    total_count = len(results)
+
+    summary = (
+        "📊 <b>Результати перевірки всіх спеціальностей</b>\n"
+        "Для кожної програми використано окремий бал.\n\n"
+        f"Усього проаналізовано: <b>{total_count}</b>\n"
+        f"✅ Проходиш на бюджет: <b>{len(definite)}</b>\n"
+        f"⚠️ На межі бюджету: <b>{len(border)}</b>\n"
+        f"❌ Поза бюджетом: <b>{len(outside)}</b>"
+    )
+
+    messages: list[str] = [summary]
+
+    def make_result_block(
+        result: dict[str, Any],
+        number: int,
+        category: str,
+    ) -> str:
+        short_name = _safe(
+            get_short_speciality_name(
+                result["full_name"]
+            )
+        )
+
+        state_seats = result.get(
+            "state_seats"
+        )
+
+        seats_text = (
+            str(state_seats)
+            if state_seats is not None
+            else "невідомо"
+        )
+
+        place_text = _place_text(
+            result
+        )
+
+        priority_forecast = result.get(
+            "priority_1_2_forecast",
+            {},
+        )
+
+        priority_best = priority_forecast.get(
+            "best_place"
+        )
+        priority_worst = priority_forecast.get(
+            "worst_place"
+        )
+
+        if priority_best is None:
+            priority_place_text = "невідомо"
+        elif priority_best == priority_worst:
+            priority_place_text = str(
+                priority_best
+            )
+        else:
+            priority_place_text = (
+                f"{priority_best}–{priority_worst}"
             )
 
-            block_lines = [
-                f"<b>{number}. {short_name}</b>",
-                f"Ваш бал: <b>{result['score']:.3f}</b>",
-                (
-                    f"Місце: <b>{_place_text(result)} із "
-                    f"{result['state_seats']}</b> бюджетних"
-                ),
-                (
-                    "Місце серед заяв із пріоритетами 1–2: "
-                    f"<b>{result['priority_1_2_forecast']['best_place']}"
-                    f"{'–' + str(result['priority_1_2_forecast']['worst_place']) if result['priority_1_2_forecast']['best_place'] != result['priority_1_2_forecast']['worst_place'] else ''}"
-                    f"</b>"
-                ),
-                (
-                    "Учасників конкурсу на бюджет: "
-                    f"{result['budget_applicants_count']}"
-                ),
-            ]
+        category_icon = {
+            "definite": "✅",
+            "border": "⚠️",
+            "outside": "❌",
+            "unknown": "❔",
+        }.get(
+            category,
+            "•",
+        )
 
-            if result["budget_border"] is not None:
-                block_lines.append(
-                    "Поточна межа бюджету: "
-                    f"{result['budget_border']:.3f}"
+        lines = [
+            (
+                f"{category_icon} <b>{number}. "
+                f"{short_name}</b>"
+            ),
+            (
+                f"Ваш бал: "
+                f"<b>{result['score']:.3f}</b>"
+            ),
+            (
+                "Місце у загальному рейтингу: "
+                f"<b>{place_text} із {seats_text} "
+                "бюджетних</b>"
+            ),
+            (
+                "Місце серед заяв із пріоритетами 1–2: "
+                f"<b>{priority_place_text}</b>"
+            ),
+            (
+                "Учасників конкурсу на бюджет: "
+                f"<b>{result['budget_applicants_count']}</b>"
+            ),
+        ]
+
+        if result.get("budget_border") is not None:
+            lines.append(
+                "Поточна межа бюджету: "
+                f"<b>{result['budget_border']:.3f}</b>"
+            )
+
+        if category == "definite":
+            lines.append(
+                "Висновок: "
+                "<b>у межах держзамовлення</b>"
+            )
+
+        elif category == "border":
+            lines.append(
+                "Висновок: "
+                "<b>на межі через однакові бали</b>"
+            )
+
+        elif category == "outside":
+            places_below = (
+                result["best_place"]
+                - state_seats
+                if state_seats is not None
+                else None
+            )
+
+            if places_below is not None:
+                lines.append(
+                    "До межі бюджету за найкращим місцем: "
+                    f"<b>{places_below}</b>"
                 )
 
-            blocks.append("\n".join(block_lines))
+            lines.append(
+                "Висновок: "
+                "<b>поза межами держзамовлення</b>"
+            )
 
-        messages.extend(_pack_html_blocks(header, blocks))
+        return "\n".join(
+            lines
+        )
 
+    if definite:
+        definite_blocks = [
+            make_result_block(
+                result,
+                number,
+                "definite",
+            )
+            for number, result in enumerate(
+                definite,
+                start=1,
+            )
+        ]
+
+        messages.extend(
+            _pack_html_blocks(
+                "✅ <b>ПРОХОДИШ НА ДЕРЖАВНЕ ЗАМОВЛЕННЯ</b>",
+                definite_blocks,
+            )
+        )
     else:
         messages.append(
-            f"{header}\n\n"
-            "Не знайдено програм із гарантованим "
-            "потраплянням у межі держзамовлення."
+            "✅ <b>ПРОХОДИШ НА ДЕРЖАВНЕ ЗАМОВЛЕННЯ</b>\n\n"
+            "Таких спеціальностей не знайдено."
         )
 
     if border:
-        border_header = (
-            "⚠️ <b>На межі державного замовлення "
-            "через однакові бали</b>"
+        border_blocks = [
+            make_result_block(
+                result,
+                number,
+                "border",
+            )
+            for number, result in enumerate(
+                border,
+                start=1,
+            )
+        ]
+
+        messages.extend(
+            _pack_html_blocks(
+                "⚠️ <b>НА МЕЖІ ДЕРЖАВНОГО ЗАМОВЛЕННЯ</b>",
+                border_blocks,
+            )
         )
 
-        border_blocks = []
+    if outside:
+        outside_blocks = [
+            make_result_block(
+                result,
+                number,
+                "outside",
+            )
+            for number, result in enumerate(
+                outside,
+                start=1,
+            )
+        ]
 
-        for result in border:
-            short_name = _safe(
-                get_short_speciality_name(result["full_name"])
+        messages.extend(
+            _pack_html_blocks(
+                "❌ <b>ПОЗА МЕЖАМИ ДЕРЖАВНОГО ЗАМОВЛЕННЯ</b>",
+                outside_blocks,
+            )
+        )
+
+    if unknown:
+        unknown_blocks = []
+
+        for number, result in enumerate(
+            unknown,
+            start=1,
+        ):
+            name = _safe(
+                result.get(
+                    "full_name",
+                    result.get(
+                        "settings_name",
+                        "Невідома спеціальність",
+                    ),
+                )
             )
 
-            border_blocks.append(
-                f"<b>{short_name}</b>\n"
-                f"Ваш бал: <b>{result['score']:.3f}</b>\n"
-                f"Можливі місця: "
-                f"<b>{result['best_place']}–{result['worst_place']} "
-                f"із {result['state_seats']}</b>"
+            unknown_blocks.append(
+                f"❔ <b>{number}. {name}</b>\n"
+                "Не вдалося визначити бюджетний статус."
             )
 
         messages.extend(
-            _pack_html_blocks(border_header, border_blocks)
+            _pack_html_blocks(
+                "❔ <b>СТАТУС НЕ ВИЗНАЧЕНО</b>",
+                unknown_blocks,
+            )
         )
 
     if analysis["errors"]:
-        error_lines = [
-            "⚠️ <b>Не вдалося перевірити деякі сторінки</b>",
-            *[
-                f"• {_safe(error)}"
-                for error in analysis["errors"]
-            ],
+        error_blocks = [
+            f"• {_safe(error)}"
+            for error in analysis["errors"]
         ]
-        messages.append("\n".join(error_lines))
+
+        messages.extend(
+            _pack_html_blocks(
+                "⚠️ <b>ПОМИЛКИ ПІД ЧАС АНАЛІЗУ</b>",
+                error_blocks,
+            )
+        )
 
     return messages
