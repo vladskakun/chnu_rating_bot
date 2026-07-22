@@ -186,115 +186,109 @@ def is_contract_only(features: str) -> bool:
 # ПОШУК СПЕЦІАЛЬНОСТЕЙ І КІЛЬКОСТІ МІСЦЬ
 # ============================================================
 
-def get_rating_table_type(table: Any) -> str | None:
+
+def get_tables_in_speciality_section(
+    heading: Any,
+) -> list[Any]:
     """
-    Визначає тип рейтингової таблиці.
+    Повертає всі таблиці між поточним h4 та наступним h4.
 
-    На реальній сторінці ЧНУ напис «зарахування за конкурсом»
-    часто розміщений окремим елементом ПЕРЕД таблицею, а не
-    всередині самої таблиці. Тому перевіряємо:
-
-    1. текст усередині таблиці;
-    2. найближчий рейтинговий заголовок перед таблицею;
-    3. зупиняємося біля попередньої таблиці або наступної межі ОП.
+    На сторінці ЧНУ таблиці розташовані у такому порядку:
+    квота 1, квота 2, загальний конкурс. Не кожна квота
+    обов'язково присутня, але загальний конкурс є останнім.
     """
 
-    if table is None:
-        return None
+    tables: list[Any] = []
+    seen_ids: set[int] = set()
 
-    table_text = normalize_text(
-        table.get_text(" ", strip=True)
-    )
-
-    if "зарахування за конкурсом" in table_text:
-        return "competition"
-
-    if "зарахування за квотою" in table_text:
-        return "quota"
-
-    # Заголовок рейтингу може бути у div, p, b, h5 тощо
-    # безпосередньо перед самою таблицею.
-    for element in table.previous_elements:
-        element_name = getattr(
-            element,
-            "name",
-            None,
-        )
-
-        # Не дозволяємо випадково взяти заголовок
-        # від попередньої спеціальності або попередньої таблиці.
-        if element_name in {"h4", "table"}:
+    for element in heading.find_all_next(
+        ["h4", "table"]
+    ):
+        if element.name == "h4":
             break
 
-        if not isinstance(element, str):
+        if element.name != "table":
             continue
 
-        previous_text = normalize_text(
-            str(element)
-        )
+        # Не додаємо ту саму таблицю повторно.
+        element_id = id(element)
 
-        if "зарахування за конкурсом" in previous_text:
-            return "competition"
+        if element_id in seen_ids:
+            continue
 
-        if "зарахування за квотою" in previous_text:
-            return "quota"
+        seen_ids.add(element_id)
+        tables.append(element)
 
-    return None
+    return tables
 
 
-def is_competition_rating_table(table: Any) -> bool:
-    """Перевіряє належність таблиці до загального конкурсу."""
+def get_competition_table(
+    heading: Any,
+) -> Any | None:
+    """
+    Повертає таблицю «зарахування за конкурсом».
 
-    return get_rating_table_type(table) == "competition"
+    У кожній секції ЧНУ загальний конкурс іде після квот,
+    тому беремо останню таблицю перед наступним h4.
+    """
+
+    tables = get_tables_in_speciality_section(
+        heading
+    )
+
+    if not tables:
+        return None
+
+    return tables[-1]
 
 
 def find_speciality_section(
     soup: BeautifulSoup,
     search_text: str,
 ) -> dict[str, Any] | None:
-    """
-    Знаходить заголовок, держмісця та таблицю загального конкурсу.
+    """Знаходить спеціальність, держмісця та конкурсну таблицю."""
 
-    Якщо перед загальним конкурсом розміщені таблиці квоти 1
-    або квоти 2, вони пропускаються.
-    """
-
-    normalized_search = normalize_text(search_text)
+    normalized_search = normalize_text(
+        search_text
+    )
 
     for heading in soup.find_all("h4"):
-        heading_text = heading.get_text(" ", strip=True)
+        heading_text = heading.get_text(
+            " ",
+            strip=True,
+        )
 
-        if normalized_search not in normalize_text(heading_text):
+        if (
+            normalized_search
+            not in normalize_text(heading_text)
+        ):
             continue
 
         seats_element = None
-        rating_table = None
 
-        for element in heading.find_all_next(["h4", "h5", "table"]):
+        for element in heading.find_all_next(
+            ["h4", "h5"]
+        ):
             if element.name == "h4":
                 break
 
-            if element.name == "h5":
-                element_text = normalize_text(
-                    element.get_text(" ", strip=True)
+            element_text = normalize_text(
+                element.get_text(
+                    " ",
+                    strip=True,
                 )
+            )
 
-                if "держзамовлення" in element_text:
-                    seats_element = element
-
-                continue
-
-            if (
-                element.name == "table"
-                and is_competition_rating_table(element)
-            ):
-                rating_table = element
+            if "держзамовлення" in element_text:
+                seats_element = element
                 break
 
         return {
             "full_name": heading_text,
             "seats_element": seats_element,
-            "table": rating_table,
+            "table": get_competition_table(
+                heading
+            ),
         }
 
     return None
@@ -355,8 +349,9 @@ def parse_state_seats(seats_element: Any) -> int | None:
 # ЗЧИТУВАННЯ ВСТУПНИКІВ
 # ============================================================
 
+
 def parse_applicants(table: Any) -> list[dict[str, Any]]:
-    """Зчитує всіх вступників із таблиці загального конкурсу."""
+    """Зчитує вступників із таблиці загального конкурсу."""
 
     applicants: list[dict[str, Any]] = []
 
@@ -364,19 +359,35 @@ def parse_applicants(table: Any) -> list[dict[str, Any]]:
         return applicants
 
     for row in table.find_all("tr"):
-        cells = row.find_all(["td", "th"])
+        # Спочатку беремо прямі комірки рядка.
+        cells = row.find_all(
+            ["td", "th"],
+            recursive=False,
+        )
+
+        # Fallback для нестандартної вкладеності HTML.
+        if len(cells) < 3:
+            cells = row.find_all(
+                ["td", "th"]
+            )
 
         values = [
-            cell.get_text(" ", strip=True)
+            cell.get_text(
+                " ",
+                strip=True,
+            )
             for cell in cells
         ]
 
         if len(values) < 3:
             continue
 
-        position_text = values[0].strip().rstrip(".")
+        position_match = re.fullmatch(
+            r"\s*(\d+)\.?\s*",
+            values[0].replace("\xa0", " "),
+        )
 
-        if not position_text.isdigit():
+        if position_match is None:
             continue
 
         score = parse_score(values[2])
@@ -384,25 +395,48 @@ def parse_applicants(table: Any) -> list[dict[str, Any]]:
         if score is None:
             continue
 
-        features = values[3] if len(values) >= 4 else ""
-        confirmed_place = values[4] if len(values) >= 5 else ""
-        priority = values[5] if len(values) >= 6 else ""
+        name = values[1].strip()
+
+        if not name:
+            continue
+
+        features = (
+            values[3]
+            if len(values) >= 4
+            else ""
+        )
+        confirmed_place = (
+            values[4]
+            if len(values) >= 5
+            else ""
+        )
+        priority = (
+            values[5]
+            if len(values) >= 6
+            else ""
+        )
 
         applicants.append(
             {
-                "original_position": int(position_text),
-                "name": values[1],
+                "original_position": int(
+                    position_match.group(1)
+                ),
+                "name": name,
                 "score": score,
                 "features": features,
                 "confirmed_place": confirmed_place,
                 "priority": priority,
-                "contract_only": is_contract_only(features),
+                "contract_only": is_contract_only(
+                    features
+                ),
             }
         )
 
+    # Зберігаємо рейтинговий порядок сторінки.
     applicants.sort(
-        key=lambda applicant: applicant["score"],
-        reverse=True,
+        key=lambda applicant: (
+            applicant["original_position"]
+        )
     )
 
     return applicants
@@ -571,6 +605,17 @@ def analyse_speciality(
     state_seats = parse_state_seats(section["seats_element"])
     all_applicants = parse_applicants(section["table"])
 
+    if not all_applicants:
+        return {
+            "success": False,
+            "settings_name": settings["name"],
+            "error": (
+                "Таблицю загального конкурсу знайдено, "
+                "але не вдалося прочитати жодної заявки. "
+                "Перевірте актуальну структуру сторінки ЧНУ."
+            ),
+        }
+
     budget_applicants = [
         applicant
         for applicant in all_applicants
@@ -734,52 +779,46 @@ def person_name_matches(
     )
 
 
+
 def iter_speciality_competition_tables(
     soup: BeautifulSoup,
 ):
     """
-    Послідовно повертає всі спеціальності та їхні таблиці
-    «зарахування за конкурсом».
+    Повертає кожну ОП та останню таблицю її секції.
 
-    Таблиці квоти 1 і квоти 2 повністю пропускаються.
+    Остання таблиця — загальний конкурс; квотні таблиці
+    розміщені перед нею та не використовуються.
     """
 
-    headings = soup.find_all("h4")
-
-    for heading in headings:
+    for heading in soup.find_all("h4"):
         full_name = heading.get_text(
             " ",
             strip=True,
         )
+        normalized_heading = normalize_text(
+            full_name
+        )
 
-        # Заголовок має бути схожим на освітню програму.
-        normalized_heading = normalize_text(full_name)
-
-        if "оп " not in normalized_heading and "оп\"" not in normalized_heading:
-            # Додаткова перевірка без залежності від конкретних лапок.
-            if re.search(r"(^|\s)оп(\s|$)", normalized_heading) is None:
-                continue
-
-        competition_table = None
-
-        for element in heading.find_all_next(
-            ["h4", "table"]
+        if (
+            re.search(
+                r"(^|\s)оп(\s|[\"«])",
+                normalized_heading,
+            )
+            is None
         ):
-            if element.name == "h4":
-                break
+            continue
 
-            if (
-                element.name == "table"
-                and is_competition_rating_table(element)
-            ):
-                competition_table = element
-                break
+        competition_table = get_competition_table(
+            heading
+        )
 
-        if competition_table is not None:
-            yield {
-                "full_name": full_name,
-                "table": competition_table,
-            }
+        if competition_table is None:
+            continue
+
+        yield {
+            "full_name": full_name,
+            "table": competition_table,
+        }
 
 
 def search_applicant_in_all_ratings(
@@ -807,6 +846,8 @@ def search_applicant_in_all_ratings(
     matches: list[dict[str, Any]] = []
     errors: list[str] = []
     seen: set[tuple[str, int, str]] = set()
+    scanned_specialities = 0
+    scanned_applicants = 0
 
     for url in ALL_SPECIALTIES_URLS:
         try:
@@ -824,8 +865,13 @@ def search_applicant_in_all_ratings(
         for section in iter_speciality_competition_tables(
             soup
         ):
+            scanned_specialities += 1
+
             applicants = parse_applicants(
                 section["table"]
+            )
+            scanned_applicants += len(
+                applicants
             )
 
             for applicant in applicants:
@@ -868,6 +914,8 @@ def search_applicant_in_all_ratings(
         "matches": matches,
         "errors": errors,
         "invalid_query": False,
+        "scanned_specialities": scanned_specialities,
+        "scanned_applicants": scanned_applicants,
     }
 
 
@@ -1095,10 +1143,23 @@ def format_person_search_results(
     )
 
     if not matches:
-        messages = [
-            f"{header}\n\n"
-            "У підключених рейтингах збігів не знайдено."
-        ]
+        scanned_applicants = analysis.get(
+            "scanned_applicants",
+            0,
+        )
+
+        if scanned_applicants == 0:
+            messages = [
+                f"{header}\n\n"
+                "❌ Бот не зміг прочитати жодної заявки "
+                "зі сторінки. Це технічна помилка парсера, "
+                "а не відсутність людини у рейтингах."
+            ]
+        else:
+            messages = [
+                f"{header}\n\n"
+                "У підключених рейтингах збігів не знайдено."
+            ]
     else:
         blocks: list[str] = []
 
