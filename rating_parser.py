@@ -182,6 +182,142 @@ def is_contract_only(features: str) -> bool:
     return "ПЛ" in tokens
 
 
+def parse_priority_values(priority_text: str) -> set[int]:
+    """
+    Витягує окремі номери пріоритетів із комірки.
+
+    Приклади:
+    - "1" -> {1}
+    - "2,7" -> {2, 7}
+    - "1,6" -> {1, 6}
+    - "10" -> {10}, а не {1, 0}
+    """
+
+    return {
+        int(value)
+        for value in re.findall(
+            r"\d+",
+            priority_text or "",
+        )
+    }
+
+
+def has_priority_1_or_2(priority_text: str) -> bool:
+    """Перевіряє, чи є у заяви пріоритет 1 або 2."""
+
+    priorities = parse_priority_values(
+        priority_text
+    )
+
+    return bool(
+        priorities.intersection({1, 2})
+    )
+
+
+def filter_priority_1_2_applicants(
+    applicants: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Залишає лише бюджетні заявки з пріоритетом 1 або 2.
+
+    Заяви з позначкою ПЛ не враховуються.
+    """
+
+    return [
+        applicant
+        for applicant in applicants
+        if (
+            not applicant["contract_only"]
+            and has_priority_1_or_2(
+                applicant.get("priority", "")
+            )
+        )
+    ]
+
+
+def calculate_priority_1_2_forecast(
+    applicants: list[dict[str, Any]],
+    my_score: float,
+) -> dict[str, int]:
+    """
+    Обчислює прогнозоване місце за балом,
+    враховуючи лише заявки з пріоритетами 1–2.
+    """
+
+    filtered = filter_priority_1_2_applicants(
+        applicants
+    )
+
+    forecast = calculate_forecast(
+        filtered,
+        my_score,
+    )
+
+    return {
+        **forecast,
+        "applicants_count": len(filtered),
+    }
+
+
+def calculate_person_priority_1_2_position(
+    applicants: list[dict[str, Any]],
+    person: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Обчислює позицію людини серед заяв із пріоритетами 1–2.
+
+    Якщо її власна заява має пріоритет 1/2 і не містить ПЛ,
+    вона вже є частиною відфільтрованого рейтингу.
+
+    Якщо пріоритет інший, повертається умовна позиція за балом,
+    ніби цю людину додали до рейтингу пріоритетів 1–2.
+    """
+
+    filtered = filter_priority_1_2_applicants(
+        applicants
+    )
+
+    person_is_included = (
+        not person["contract_only"]
+        and has_priority_1_or_2(
+            person.get("priority", "")
+        )
+    )
+
+    higher_count = sum(
+        applicant["score"] > person["score"]
+        for applicant in filtered
+    )
+
+    equal_count = sum(
+        abs(
+            applicant["score"] - person["score"]
+        ) < 0.000001
+        for applicant in filtered
+        if applicant is not person
+    )
+
+    best_place = higher_count + 1
+    worst_place = (
+        higher_count
+        + equal_count
+        + 1
+    )
+
+    total_count = (
+        len(filtered)
+        if person_is_included
+        else len(filtered) + 1
+    )
+
+    return {
+        "best_place": best_place,
+        "worst_place": worst_place,
+        "total_count": total_count,
+        "person_is_included": person_is_included,
+    }
+
+
 # ============================================================
 # ПОШУК СПЕЦІАЛЬНОСТЕЙ І КІЛЬКОСТІ МІСЦЬ
 # ============================================================
@@ -638,6 +774,13 @@ def analyse_speciality(
         count=NEIGHBORS_COUNT,
     )
 
+    priority_1_2_forecast = (
+        calculate_priority_1_2_forecast(
+            all_applicants,
+            settings["score"],
+        )
+    )
+
     budget_border = get_current_budget_border(
         budget_applicants,
         state_seats,
@@ -654,6 +797,7 @@ def analyse_speciality(
         "contract_only_count": contract_only_count,
         "budget_border": budget_border,
         "nearby_applicants": nearby_applicants,
+        "priority_1_2_forecast": priority_1_2_forecast,
         "status": get_budget_status(
             forecast["best_place"],
             forecast["worst_place"],
@@ -921,6 +1065,16 @@ def search_applicant_in_all_ratings(
                         "position": applicant[
                             "original_position"
                         ],
+                        "priority": applicant.get(
+                            "priority",
+                            "",
+                        ),
+                        "priority_1_2_position": (
+                            calculate_person_priority_1_2_position(
+                                applicants,
+                                applicant,
+                            )
+                        ),
                         "state_seats": section[
                             "state_seats"
                         ],
@@ -1019,6 +1173,14 @@ def format_speciality_result(result: dict[str, Any]) -> str:
         (
             "Прогнозоване місце: "
             f"<b>{_place_text(result)} із {seats_text}</b> бюджетних"
+        ),
+        (
+            "Місце лише серед заяв із пріоритетами 1–2: "
+            f"<b>"
+            f"{result['priority_1_2_forecast']['best_place']}"
+            f"{'–' + str(result['priority_1_2_forecast']['worst_place']) if result['priority_1_2_forecast']['best_place'] != result['priority_1_2_forecast']['worst_place'] else ''}"
+            f" із {result['priority_1_2_forecast']['applicants_count'] + 1}"
+            f"</b>"
         ),
         "",
         f"Усього заяв: {result['all_applicants_count']}",
@@ -1214,10 +1376,44 @@ def format_person_search_results(
                     f"з {state_seats} бюджетних"
                 )
 
+            priority_position = match[
+                "priority_1_2_position"
+            ]
+            application_priority = _safe(
+                match.get("priority") or "не вказано"
+            )
+
+            priority_place_text = str(
+                priority_position["best_place"]
+            )
+
+            if (
+                priority_position["best_place"]
+                != priority_position["worst_place"]
+            ):
+                priority_place_text = (
+                    f"{priority_position['best_place']}"
+                    f"–{priority_position['worst_place']}"
+                )
+
+            priority_label = (
+                "Місце серед заяв із пріоритетами 1–2"
+                if priority_position["person_is_included"]
+                else (
+                    "Умовне місце за балом серед заяв "
+                    "із пріоритетами 1–2"
+                )
+            )
+
             blocks.append(
                 f"<b>{number}. {speciality_name}</b>\n"
                 f"Місце в рейтингу: "
-                f"<b>{place_text}</b>"
+                f"<b>{place_text}</b>\n"
+                f"Пріоритет заяви: "
+                f"<b>{application_priority}</b>\n"
+                f"{priority_label}: "
+                f"<b>{priority_place_text} "
+                f"із {priority_position['total_count']}</b>"
             )
 
         messages = _pack_html_blocks(
