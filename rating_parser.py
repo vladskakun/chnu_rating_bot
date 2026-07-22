@@ -784,10 +784,11 @@ def iter_speciality_competition_tables(
     soup: BeautifulSoup,
 ):
     """
-    Повертає кожну ОП та останню таблицю її секції.
+    Повертає кожну ОП, її конкурсну таблицю
+    та кількість місць державного замовлення.
 
-    Остання таблиця — загальний конкурс; квотні таблиці
-    розміщені перед нею та не використовуються.
+    Остання таблиця секції — загальний конкурс;
+    квотні таблиці розміщені перед нею.
     """
 
     for heading in soup.find_all("h4"):
@@ -815,9 +816,31 @@ def iter_speciality_competition_tables(
         if competition_table is None:
             continue
 
+        seats_element = None
+
+        for element in heading.find_all_next(
+            ["h4", "h5"]
+        ):
+            if element.name == "h4":
+                break
+
+            element_text = normalize_text(
+                element.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+            if "держзамовлення" in element_text:
+                seats_element = element
+                break
+
         yield {
             "full_name": full_name,
             "table": competition_table,
+            "state_seats": parse_state_seats(
+                seats_element
+            ),
         }
 
 
@@ -897,6 +920,9 @@ def search_applicant_in_all_ratings(
                         "full_name": section["full_name"],
                         "position": applicant[
                             "original_position"
+                        ],
+                        "state_seats": section[
+                            "state_seats"
                         ],
                         "name": applicant["name"],
                     }
@@ -1173,10 +1199,25 @@ def format_person_search_results(
                 )
             )
 
+            state_seats = match.get(
+                "state_seats"
+            )
+
+            if state_seats is None:
+                place_text = (
+                    f"{match['position']} місце; "
+                    "кількість бюджетних місць невідома"
+                )
+            else:
+                place_text = (
+                    f"{match['position']} місце "
+                    f"з {state_seats} бюджетних"
+                )
+
             blocks.append(
                 f"<b>{number}. {speciality_name}</b>\n"
                 f"Місце в рейтингу: "
-                f"<b>{match['position']}</b>"
+                f"<b>{place_text}</b>"
             )
 
         messages = _pack_html_blocks(
