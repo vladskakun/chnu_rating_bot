@@ -186,25 +186,66 @@ def is_contract_only(features: str) -> bool:
 # ПОШУК СПЕЦІАЛЬНОСТЕЙ І КІЛЬКОСТІ МІСЦЬ
 # ============================================================
 
-def is_competition_rating_table(table: Any) -> bool:
+def get_rating_table_type(table: Any) -> str | None:
     """
-    Перевіряє, що таблиця належить саме до загального конкурсу.
+    Визначає тип рейтингової таблиці.
 
-    Таблиці «зарахування за квотою 1/2» навмисно
-    не використовуються ні для прогнозу, ні для пошуку.
+    На реальній сторінці ЧНУ напис «зарахування за конкурсом»
+    часто розміщений окремим елементом ПЕРЕД таблицею, а не
+    всередині самої таблиці. Тому перевіряємо:
+
+    1. текст усередині таблиці;
+    2. найближчий рейтинговий заголовок перед таблицею;
+    3. зупиняємося біля попередньої таблиці або наступної межі ОП.
     """
 
     if table is None:
-        return False
+        return None
 
     table_text = normalize_text(
         table.get_text(" ", strip=True)
     )
 
-    return (
-        "рейтинговий список абітурієнтів" in table_text
-        and "зарахування за конкурсом" in table_text
-    )
+    if "зарахування за конкурсом" in table_text:
+        return "competition"
+
+    if "зарахування за квотою" in table_text:
+        return "quota"
+
+    # Заголовок рейтингу може бути у div, p, b, h5 тощо
+    # безпосередньо перед самою таблицею.
+    for element in table.previous_elements:
+        element_name = getattr(
+            element,
+            "name",
+            None,
+        )
+
+        # Не дозволяємо випадково взяти заголовок
+        # від попередньої спеціальності або попередньої таблиці.
+        if element_name in {"h4", "table"}:
+            break
+
+        if not isinstance(element, str):
+            continue
+
+        previous_text = normalize_text(
+            str(element)
+        )
+
+        if "зарахування за конкурсом" in previous_text:
+            return "competition"
+
+        if "зарахування за квотою" in previous_text:
+            return "quota"
+
+    return None
+
+
+def is_competition_rating_table(table: Any) -> bool:
+    """Перевіряє належність таблиці до загального конкурсу."""
+
+    return get_rating_table_type(table) == "competition"
 
 
 def find_speciality_section(
@@ -522,8 +563,8 @@ def analyse_speciality(
             "success": False,
             "settings_name": settings["name"],
             "error": (
-                "Спеціальність знайдено, але рейтингову "
-                "таблицю не вдалося визначити."
+                "Спеціальність знайдено, але таблицю "
+                "«зарахування за конкурсом» не вдалося визначити."
             ),
         }
 
