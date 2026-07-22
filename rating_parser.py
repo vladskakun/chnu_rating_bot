@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 import threading
@@ -430,30 +431,93 @@ def find_speciality_section(
     return None
 
 
+def make_all_speciality_key(
+    url: str,
+    full_name: str,
+) -> str:
+    """
+    Створює стабільний ключ для ОП зі сторінки.
+
+    Ключ не залежить від порядку програм і підходить
+    для окремої історії останніх балів у SQLite.
+    """
+
+    source = (
+        f"{url}|{normalize_text(full_name)}"
+    ).encode("utf-8")
+
+    digest = hashlib.sha1(
+        source
+    ).hexdigest()[:16]
+
+    return f"all_{digest}"
+
+
+def get_speciality_display_name(
+    full_name: str,
+) -> str:
+    """Повертає коротку назву ОП для діалогу Telegram."""
+
+    quoted_parts = re.findall(
+        r'["«](.*?)["»]',
+        full_name,
+    )
+
+    if quoted_parts:
+        return " / ".join(quoted_parts)
+
+    return full_name
+
+
 def find_all_specialities(
     soup: BeautifulSoup,
     url: str,
-    score: float,
+    score: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Формує список усіх освітніх програм на сторінці."""
+    """
+    Формує список усіх реальних ОП на сторінці.
+
+    Додаються тільки секції, у яких знайдено таблицю
+    загального конкурсу.
+    """
 
     specialities: list[dict[str, Any]] = []
 
     for heading in soup.find_all("h4"):
-        full_name = heading.get_text(" ", strip=True)
-        normalized_name = normalize_text(full_name)
+        full_name = heading.get_text(
+            " ",
+            strip=True,
+        )
+        normalized_name = normalize_text(
+            full_name
+        )
 
-        if re.search(r"\bоп\b", normalized_name) is None:
+        if re.search(
+            r"(^|\s)оп(\s|[\"«])",
+            normalized_name,
+        ) is None:
             continue
 
-        specialities.append(
-            {
-                "name": full_name,
-                "url": url,
-                "search_text": full_name,
-                "score": score,
-            }
-        )
+        if get_competition_table(heading) is None:
+            continue
+
+        speciality = {
+            "key": make_all_speciality_key(
+                url,
+                full_name,
+            ),
+            "name": get_speciality_display_name(
+                full_name
+            ),
+            "full_name": full_name,
+            "url": url,
+            "search_text": full_name,
+        }
+
+        if score is not None:
+            speciality["score"] = float(score)
+
+        specialities.append(speciality)
 
     return specialities
 
@@ -811,6 +875,49 @@ def analyse_speciality(
 # ПУБЛІЧНІ ФУНКЦІЇ ДЛЯ TELEGRAM-БОТА
 # ============================================================
 
+def discover_all_specialities() -> dict[str, Any]:
+    """
+    Завантажує всі ОП зі сторінок ALL_SPECIALTIES_URLS.
+
+    Повертає серіалізований список налаштувань, який можна
+    тимчасово зберігати у FSM aiogram.
+    """
+
+    specialities: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen_keys: set[str] = set()
+
+    for url in ALL_SPECIALTIES_URLS:
+        try:
+            soup = get_page(
+                url,
+                force_refresh=True,
+            )
+
+        except requests.RequestException as error:
+            errors.append(
+                f"{url}: {error}"
+            )
+            continue
+
+        for speciality in find_all_specialities(
+            soup=soup,
+            url=url,
+        ):
+            key = speciality["key"]
+
+            if key in seen_keys:
+                continue
+
+            seen_keys.add(key)
+            specialities.append(speciality)
+
+    return {
+        "specialities": specialities,
+        "errors": errors,
+    }
+
+
 def analyse_selected_specialities(
     scores: float | dict[str, float],
 ) -> list[dict[str, Any]]:
@@ -1100,32 +1207,74 @@ def search_applicant_in_all_ratings(
 
 
 def analyse_all_specialities(
-    score: float,
+    scores: float | dict[str, float],
+    settings_list: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Аналізує всі ОП на сторінках ALL_SPECIALTIES_URLS."""
+    """
+    Аналізує всі ОП.
+
+    Рекомендований режим — передати окремий бал у словнику
+    для кожного key зі settings_list. Число підтримується
+    лише для сумісності зі старими викликами.
+    """
 
     results: list[dict[str, Any]] = []
     errors: list[str] = []
 
-    for url in ALL_SPECIALTIES_URLS:
-        try:
-            soup = get_page(url)
+    if settings_list is None:
+        discovery = discover_all_specialities()
+        settings_list = discovery["specialities"]
+        errors.extend(discovery["errors"])
 
-        except requests.RequestException as error:
-            errors.append(f"{url}: {error}")
-            continue
+    pages: dict[str, BeautifulSoup] = {}
 
-        settings_list = find_all_specialities(
-            soup=soup,
-            url=url,
-            score=score,
+    for speciality in settings_list:
+        key = speciality["key"]
+
+        if isinstance(scores, dict):
+            score = scores.get(key)
+
+            if score is None:
+                errors.append(
+                    "Не вказано бал для: "
+                    f"{speciality['name']}"
+                )
+                continue
+        else:
+            score = scores
+
+        url = speciality["url"]
+
+        if url not in pages:
+            try:
+                pages[url] = get_page(
+                    url,
+                    force_refresh=True,
+                )
+
+            except requests.RequestException as error:
+                errors.append(
+                    f"{url}: {error}"
+                )
+                continue
+
+        settings = {
+            **speciality,
+            "score": float(score),
+        }
+
+        result = analyse_speciality(
+            pages[url],
+            settings,
         )
 
-        for settings in settings_list:
-            result = analyse_speciality(soup, settings)
-
-            if result["success"]:
-                results.append(result)
+        if result["success"]:
+            results.append(result)
+        else:
+            errors.append(
+                f"{speciality['name']}: "
+                f"{result['error']}"
+            )
 
     return {
         "results": results,
@@ -1435,9 +1584,12 @@ def format_person_search_results(
 
 def format_all_budget_specialities(
     analysis: dict[str, Any],
-    score: float,
 ) -> list[str]:
-    """Формує повідомлення зі всіма ОП, де є шанс на бюджет."""
+    """
+    Формує ОП, де користувач проходить або перебуває на межі.
+
+    Кожний результат уже містить власний конкурсний бал.
+    """
 
     results = analysis["results"]
 
@@ -1461,7 +1613,7 @@ def format_all_budget_specialities(
     header = (
         "✅ <b>Спеціальності, де ви проходите "
         "на державне замовлення</b>\n"
-        f"Перевірений бал: <b>{score:.3f}</b>"
+        "Для кожної програми використано окремий бал."
     )
 
     if definite:
@@ -1474,9 +1626,16 @@ def format_all_budget_specialities(
 
             block_lines = [
                 f"<b>{number}. {short_name}</b>",
+                f"Ваш бал: <b>{result['score']:.3f}</b>",
                 (
                     f"Місце: <b>{_place_text(result)} із "
                     f"{result['state_seats']}</b> бюджетних"
+                ),
+                (
+                    "Місце серед заяв із пріоритетами 1–2: "
+                    f"<b>{result['priority_1_2_forecast']['best_place']}"
+                    f"{'–' + str(result['priority_1_2_forecast']['worst_place']) if result['priority_1_2_forecast']['best_place'] != result['priority_1_2_forecast']['worst_place'] else ''}"
+                    f"</b>"
                 ),
                 (
                     "Учасників конкурсу на бюджет: "
@@ -1516,6 +1675,7 @@ def format_all_budget_specialities(
 
             border_blocks.append(
                 f"<b>{short_name}</b>\n"
+                f"Ваш бал: <b>{result['score']:.3f}</b>\n"
                 f"Можливі місця: "
                 f"<b>{result['best_place']}–{result['worst_place']} "
                 f"із {result['state_seats']}</b>"

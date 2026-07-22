@@ -19,6 +19,7 @@ from rating_parser import (
     SPECIALTIES,
     analyse_all_specialities,
     analyse_selected_specialities,
+    discover_all_specialities,
     format_all_budget_specialities,
     format_person_search_results,
     format_speciality_result,
@@ -27,7 +28,7 @@ from rating_parser import (
     search_applicant_in_all_ratings,
 )
 from score_history import (
-    ALL_SPECIALITIES_CONTEXT,
+    all_speciality_context,
     get_recent_scores,
     init_database,
     save_score,
@@ -143,58 +144,69 @@ async def show_main_menu(
     )
 
 
+def get_current_speciality(
+    data: dict,
+) -> tuple[dict, int, int] | None:
+    """
+    Повертає поточну ОП, її індекс і загальну кількість
+    відповідно до активного режиму.
+    """
+
+    mode = data.get("mode")
+    index = int(data.get("speciality_index", 0))
+
+    if mode == "selected":
+        specialities = SPECIALTIES
+
+    elif mode == "all":
+        specialities = data.get(
+            "all_specialities",
+            [],
+        )
+
+    else:
+        return None
+
+    if not 0 <= index < len(specialities):
+        return None
+
+    return (
+        specialities[index],
+        index,
+        len(specialities),
+    )
+
+
 async def ask_score_for_current_context(
     message: Message,
     state: FSMContext,
     user_id: int,
 ) -> None:
-    """
-    Показує останні 5 балів або просить ввести новий.
-
-    Для обраних спеціальностей кожна ОП має власну історію.
-    """
+    """Запитує окремий бал для поточної ОП."""
 
     data = await state.get_data()
     mode = data.get("mode")
+    current = get_current_speciality(data)
+
+    if current is None:
+        await state.clear()
+        await message.answer(
+            "Не вдалося визначити поточну спеціальність.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    speciality, index, total = current
 
     if mode == "selected":
-        index = int(data.get("speciality_index", 0))
-
-        if not 0 <= index < len(SPECIALTIES):
-            await state.clear()
-            await message.answer(
-                "Не вдалося визначити спеціальність.",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-        speciality = SPECIALTIES[index]
         context_key = speciality_context(
             speciality["key"]
         )
 
-        prompt = (
-            f"<b>{index + 1} із {len(SPECIALTIES)}</b>\n"
-            f"🎓 <b>{speciality['name']}</b>\n\n"
-            "Оберіть попередній бал або введіть "
-            "конкурсний бал саме для цієї спеціальності."
-        )
-
-    elif mode == "all":
-        context_key = ALL_SPECIALITIES_CONTEXT
-
-        prompt = (
-            "Введіть один конкурсний бал для перевірки "
-            "всіх спеціальностей."
-        )
-
     else:
-        await state.clear()
-        await message.answer(
-            "Не вдалося визначити режим.",
-            reply_markup=main_menu_keyboard(),
+        context_key = all_speciality_context(
+            speciality["key"]
         )
-        return
 
     await state.update_data(
         score_context=context_key
@@ -204,6 +216,13 @@ async def ask_score_for_current_context(
         get_recent_scores,
         user_id,
         context_key,
+    )
+
+    prompt = (
+        f"<b>{index + 1} із {total}</b>\n"
+        f"🎓 <b>{speciality['name']}</b>\n\n"
+        "Оберіть один із попередніх балів або введіть "
+        "конкурсний бал саме для цієї спеціальності."
     )
 
     if recent_scores:
@@ -273,26 +292,28 @@ async def run_selected_analysis(
 
 async def run_all_analysis(
     message: Message,
-    score: float,
+    specialities: list[dict],
+    scores_by_speciality: dict[str, float],
 ) -> None:
     progress_message = await message.answer(
-        "⏳ Аналізую всі спеціальності..."
+        "⏳ Аналізую всі спеціальності "
+        "з окремими балами..."
     )
 
     try:
         analysis = await asyncio.to_thread(
             analyse_all_specialities,
-            score,
+            scores_by_speciality,
+            specialities,
         )
 
         messages = format_all_budget_specialities(
-            analysis,
-            score,
+            analysis
         )
 
         await progress_message.edit_text(
-            "Готово. Результати перевірки "
-            "всіх спеціальностей:"
+            "Готово. Перевірено всі спеціальності "
+            "з указаними для них балами:"
         )
 
         for text in messages:
@@ -320,24 +341,25 @@ async def accept_score(
     user_id: int,
     score: float,
 ) -> None:
-    """
-    Зберігає бал поточного кроку.
-
-    Для обраних спеціальностей переходить до наступної ОП.
-    Для режиму «Усі» одразу запускає аналіз.
-    """
+    """Зберігає бал і переходить до наступної ОП."""
 
     data = await state.get_data()
     mode = data.get("mode")
     context_key = data.get("score_context")
+    current = get_current_speciality(data)
 
-    if not isinstance(context_key, str):
+    if (
+        not isinstance(context_key, str)
+        or current is None
+    ):
         await state.clear()
         await message.answer(
             "Не вдалося визначити, для чого зберегти бал.",
             reply_markup=main_menu_keyboard(),
         )
         return
+
+    speciality, index, total = current
 
     await asyncio.to_thread(
         save_score,
@@ -346,47 +368,25 @@ async def accept_score(
         context_key,
     )
 
-    if mode == "all":
-        await state.clear()
-        await run_all_analysis(
-            message,
-            score,
-        )
-        return
-
-    if mode != "selected":
-        await state.clear()
-        await message.answer(
-            "Не вдалося визначити режим.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    index = int(data.get("speciality_index", 0))
-
-    if not 0 <= index < len(SPECIALTIES):
-        await state.clear()
-        await message.answer(
-            "Не вдалося визначити спеціальність.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    speciality = SPECIALTIES[index]
-    selected_scores = dict(
-        data.get("selected_scores", {})
+    scores_key = (
+        "selected_scores"
+        if mode == "selected"
+        else "all_scores"
     )
 
-    selected_scores[
-        speciality["key"]
-    ] = score
+    scores = dict(
+        data.get(scores_key, {})
+    )
+    scores[speciality["key"]] = score
 
     next_index = index + 1
 
-    if next_index < len(SPECIALTIES):
+    if next_index < total:
         await state.update_data(
             speciality_index=next_index,
-            selected_scores=selected_scores,
+            **{
+                scores_key: scores,
+            },
         )
 
         await ask_score_for_current_context(
@@ -396,11 +396,32 @@ async def accept_score(
         )
         return
 
-    await state.clear()
+    if mode == "selected":
+        await state.clear()
+        await run_selected_analysis(
+            message,
+            scores,
+        )
+        return
 
-    await run_selected_analysis(
-        message,
-        selected_scores,
+    if mode == "all":
+        all_specialities = data.get(
+            "all_specialities",
+            [],
+        )
+
+        await state.clear()
+        await run_all_analysis(
+            message,
+            all_specialities,
+            scores,
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "Не вдалося визначити режим.",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -442,8 +463,6 @@ async def menu_callback(
             "Оберіть режим:",
             reply_markup=main_menu_keyboard(),
         )
-
-
 
 
 @router.callback_query(F.data == "mode:search")
@@ -526,10 +545,8 @@ async def person_name_handler(
     )
 
 
-@router.callback_query(
-    F.data.in_({"mode:selected", "mode:all"})
-)
-async def mode_callback(
+@router.callback_query(F.data == "mode:selected")
+async def selected_mode_callback(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
@@ -538,23 +555,78 @@ async def mode_callback(
     if callback.message is None:
         return
 
-    if callback.data == "mode:selected":
-        await state.set_state(
-            RatingStates.choosing_score
-        )
-        await state.update_data(
-            mode="selected",
-            speciality_index=0,
-            selected_scores={},
+    await state.set_state(
+        RatingStates.choosing_score
+    )
+    await state.update_data(
+        mode="selected",
+        speciality_index=0,
+        selected_scores={},
+    )
+
+    await ask_score_for_current_context(
+        callback.message,
+        state,
+        callback.from_user.id,
+    )
+
+
+@router.callback_query(F.data == "mode:all")
+async def all_mode_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await callback.answer()
+    await state.clear()
+
+    if callback.message is None:
+        return
+
+    progress_message = await callback.message.answer(
+        "⏳ Завантажую список усіх спеціальностей..."
+    )
+
+    try:
+        discovery = await asyncio.to_thread(
+            discover_all_specialities
         )
 
-    else:
-        await state.set_state(
-            RatingStates.choosing_score
+    except Exception:
+        logging.exception(
+            "Помилка завантаження списку спеціальностей"
         )
-        await state.update_data(
-            mode="all",
+
+        await progress_message.edit_text(
+            "❌ Не вдалося завантажити список спеціальностей."
         )
+        return
+
+    specialities = discovery["specialities"]
+
+    if not specialities:
+        await progress_message.edit_text(
+            "❌ На підключених сторінках не знайдено "
+            "жодної конкурсної спеціальності."
+        )
+        return
+
+    await progress_message.edit_text(
+        "Знайдено спеціальностей: "
+        f"<b>{len(specialities)}</b>.\n"
+        "Тепер введіть окремий конкурсний бал "
+        "для кожної з них.\n\n"
+        "Скасувати процес можна командою /cancel."
+    )
+
+    await state.set_state(
+        RatingStates.choosing_score
+    )
+    await state.update_data(
+        mode="all",
+        speciality_index=0,
+        all_specialities=specialities,
+        all_scores={},
+    )
 
     await ask_score_for_current_context(
         callback.message,
@@ -601,7 +673,10 @@ async def saved_score_callback(
         "score:"
     )
 
-    if raw_score == "new" or not raw_score.isdigit():
+    if (
+        raw_score == "new"
+        or not raw_score.isdigit()
+    ):
         return
 
     if callback.message is None:

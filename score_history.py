@@ -24,9 +24,15 @@ ALL_SPECIALITIES_CONTEXT = "all"
 
 
 def speciality_context(speciality_key: str) -> str:
-    """Повертає ключ історії для конкретної спеціальності."""
+    """Повертає ключ історії для обраної спеціальності."""
 
     return f"speciality:{speciality_key}"
+
+
+def all_speciality_context(speciality_key: str) -> str:
+    """Повертає ключ історії для ОП у режимі «Усі»."""
+
+    return f"all_speciality:{speciality_key}"
 
 
 def _connect() -> sqlite3.Connection:
