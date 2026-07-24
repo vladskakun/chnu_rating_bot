@@ -1806,14 +1806,16 @@ def format_person_search_results(
                 "\n".join(lines)
             )
 
-        messages = _pack_html_blocks(
+        messages = [
             (
                 f"{header}\n"
                 f"Знайдено заяв: "
-                f"<b>{len(matches)}</b>"
+                f"<b>{len(matches)}</b>\n\n"
+                "Кожний результат надіслано "
+                "окремим повідомленням."
             ),
-            blocks,
-        )
+            *blocks,
+        ]
 
     if analysis["errors"]:
         messages.append(
