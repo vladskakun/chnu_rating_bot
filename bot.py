@@ -29,8 +29,10 @@ from rating_parser import (
 )
 from score_history import (
     all_speciality_context,
+    get_recent_name_queries,
     get_recent_scores,
     init_database,
+    save_name_query,
     save_score,
     speciality_context,
 )
@@ -42,6 +44,7 @@ router = Router()
 class RatingStates(StatesGroup):
     choosing_score = State()
     waiting_for_score = State()
+    choosing_name = State()
     waiting_for_name = State()
 
 
@@ -101,6 +104,56 @@ def score_history_keyboard(
                 InlineKeyboardButton(
                     text="✍️ Ввести новий бал",
                     callback_data="score:new",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ До головного меню",
+                    callback_data="menu:main",
+                )
+            ],
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+
+def name_history_keyboard(
+    queries: list[str],
+) -> InlineKeyboardMarkup:
+    """Створює кнопки останніх 5 запитів за ПІБ."""
+
+    rows = []
+
+    for index, query in enumerate(
+        queries
+    ):
+        display_text = (
+            query
+            if len(query) <= 48
+            else f"{query[:45]}..."
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"👤 {display_text}",
+                    callback_data=(
+                        f"name_history:{index}"
+                    ),
+                )
+            ]
+        )
+
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="✍️ Ввести нове ім’я",
+                    callback_data="name:new",
                 )
             ],
             [
@@ -465,46 +518,32 @@ async def menu_callback(
         )
 
 
-@router.callback_query(F.data == "mode:search")
-async def search_mode_callback(
-    callback: CallbackQuery,
-    state: FSMContext,
-) -> None:
-    await callback.answer()
-    await state.clear()
-    await state.set_state(
-        RatingStates.waiting_for_name
-    )
 
-    if callback.message is not None:
-        await callback.message.answer(
-            "Введіть <b>прізвище та ім’я</b>.\n"
-            "По батькові можна не вказувати.\n\n"
-            "Наприклад: <b>Савчук Роман</b>\n\n"
-            "Пошук відбувається лише у списках "
-            "«зарахування за конкурсом». "
-            "Квота 1 та квота 2 ігноруються."
-        )
-
-
-@router.message(RatingStates.waiting_for_name)
-async def person_name_handler(
+async def run_person_search(
     message: Message,
     state: FSMContext,
+    user_id: int,
+    query_text: str,
 ) -> None:
-    if message.text is None:
-        await message.answer(
-            "Надішліть прізвище та ім’я текстом."
-        )
-        return
+    """Зберігає ПІБ в історію та запускає пошук."""
 
-    if parse_person_query(message.text) is None:
+    if parse_person_query(query_text) is None:
         await message.answer(
             "Введіть щонайменше два слова: "
             "прізвище та ім’я.\n"
-            "Наприклад: <b>Савчук Роман</b>"
+            "Наприклад: <b>Скакун Ерік</b>"
         )
         return
+
+    cleaned_query = " ".join(
+        query_text.split()
+    )
+
+    await asyncio.to_thread(
+        save_name_query,
+        user_id,
+        cleaned_query,
+    )
 
     await state.clear()
 
@@ -515,7 +554,7 @@ async def person_name_handler(
     try:
         analysis = await asyncio.to_thread(
             search_applicant_in_all_ratings,
-            message.text,
+            cleaned_query,
         )
 
         result_messages = format_person_search_results(
@@ -542,6 +581,143 @@ async def person_name_handler(
     await message.answer(
         "Оберіть наступну дію:",
         reply_markup=back_to_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "mode:search")
+async def search_mode_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await callback.answer()
+    await state.clear()
+
+    if callback.message is None:
+        return
+
+    recent_queries = await asyncio.to_thread(
+        get_recent_name_queries,
+        callback.from_user.id,
+    )
+
+    if recent_queries:
+        await state.set_state(
+            RatingStates.choosing_name
+        )
+        await state.update_data(
+            recent_name_queries=recent_queries
+        )
+
+        await callback.message.answer(
+            "Оберіть один з останніх пошуків "
+            "або введіть нове прізвище та ім’я:",
+            reply_markup=name_history_keyboard(
+                recent_queries
+            ),
+        )
+        return
+
+    await state.set_state(
+        RatingStates.waiting_for_name
+    )
+
+    await callback.message.answer(
+        "Введіть <b>прізвище та ім’я</b>.\n"
+        "По батькові можна не вказувати.\n\n"
+        "Наприклад: <b>Скакун Ерік</b>\n\n"
+        "Пошук відбувається лише у списках "
+        "«зарахування за конкурсом»."
+    )
+
+
+@router.callback_query(
+    RatingStates.choosing_name,
+    F.data == "name:new",
+)
+async def new_name_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await callback.answer()
+
+    await state.set_state(
+        RatingStates.waiting_for_name
+    )
+
+    if callback.message is not None:
+        await callback.message.answer(
+            "Введіть прізвище та ім’я.\n"
+            "Наприклад: <b>Скакун Ерік</b>"
+        )
+
+
+@router.callback_query(
+    RatingStates.choosing_name,
+    F.data.startswith("name_history:"),
+)
+async def saved_name_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await callback.answer()
+
+    if (
+        callback.data is None
+        or callback.message is None
+    ):
+        return
+
+    raw_index = callback.data.removeprefix(
+        "name_history:"
+    )
+
+    if not raw_index.isdigit():
+        return
+
+    data = await state.get_data()
+    queries = data.get(
+        "recent_name_queries",
+        [],
+    )
+    index = int(raw_index)
+
+    if not 0 <= index < len(queries):
+        await callback.message.answer(
+            "Не вдалося прочитати збережений запит. "
+            "Відкрийте пошук ще раз."
+        )
+        return
+
+    await run_person_search(
+        message=callback.message,
+        state=state,
+        user_id=callback.from_user.id,
+        query_text=queries[index],
+    )
+
+
+@router.message(RatingStates.waiting_for_name)
+async def person_name_handler(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if message.text is None:
+        await message.answer(
+            "Надішліть прізвище та ім’я текстом."
+        )
+        return
+
+    if message.from_user is None:
+        await message.answer(
+            "Не вдалося визначити користувача."
+        )
+        return
+
+    await run_person_search(
+        message=message,
+        state=state,
+        user_id=message.from_user.id,
+        query_text=message.text,
     )
 
 

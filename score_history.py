@@ -20,6 +20,7 @@ DATABASE_PATH = Path(
 ).expanduser()
 
 MAX_SCORES_PER_CONTEXT = 5
+MAX_NAME_QUERIES_PER_USER = 5
 ALL_SPECIALITIES_CONTEXT = "all"
 
 
@@ -157,14 +158,36 @@ def _migrate_legacy_score_history(
 
 
 def init_database() -> None:
-    """Створює або оновлює таблицю історії балів."""
+    """Створює або оновлює таблиці історії."""
 
     with _connect() as connection:
         _migrate_legacy_score_history(connection)
 
-        # Таблиця могла залишитися від старої версії з розсилкою.
-        # Вона більше не використовується, але її наявність не заважає.
-        # Видаляти її автоматично не потрібно.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS name_query_history (
+                user_id INTEGER NOT NULL,
+                normalized_query TEXT NOT NULL,
+                query_text TEXT NOT NULL,
+                used_at REAL NOT NULL,
+                PRIMARY KEY (
+                    user_id,
+                    normalized_query
+                )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_name_query_history_latest
+            ON name_query_history (
+                user_id,
+                used_at DESC
+            )
+            """
+        )
 
 
 def _to_milli(score: float) -> int:
@@ -313,3 +336,105 @@ def get_latest_scores(
             result[context_key] = score
 
     return result
+
+
+def normalize_name_query(query_text: str) -> str:
+    """Нормалізує запит за ПІБ для перевірки дублікатів."""
+
+    return " ".join(
+        query_text.split()
+    ).casefold()
+
+
+def save_name_query(
+    user_id: int,
+    query_text: str,
+) -> None:
+    """
+    Зберігає один із останніх 5 унікальних пошуків за ПІБ.
+
+    Повторний пошук переноситься на початок історії.
+    """
+
+    cleaned_query = " ".join(
+        query_text.split()
+    ).strip()
+
+    if not cleaned_query:
+        return
+
+    normalized_query = normalize_name_query(
+        cleaned_query
+    )
+
+    with _connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO name_query_history (
+                user_id,
+                normalized_query,
+                query_text,
+                used_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(
+                user_id,
+                normalized_query
+            )
+            DO UPDATE SET
+                query_text = excluded.query_text,
+                used_at = excluded.used_at
+            """,
+            (
+                user_id,
+                normalized_query,
+                cleaned_query,
+                time.time(),
+            ),
+        )
+
+        connection.execute(
+            """
+            DELETE FROM name_query_history
+            WHERE user_id = ?
+              AND normalized_query NOT IN (
+                  SELECT normalized_query
+                  FROM name_query_history
+                  WHERE user_id = ?
+                  ORDER BY used_at DESC
+                  LIMIT ?
+              )
+            """,
+            (
+                user_id,
+                user_id,
+                MAX_NAME_QUERIES_PER_USER,
+            ),
+        )
+
+
+def get_recent_name_queries(
+    user_id: int,
+    limit: int = MAX_NAME_QUERIES_PER_USER,
+) -> list[str]:
+    """Повертає останні запити за ПІБ від нового до старого."""
+
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT query_text
+            FROM name_query_history
+            WHERE user_id = ?
+            ORDER BY used_at DESC
+            LIMIT ?
+            """,
+            (
+                user_id,
+                limit,
+            ),
+        ).fetchall()
+
+    return [
+        row["query_text"]
+        for row in rows
+    ]

@@ -1095,14 +1095,15 @@ def iter_speciality_competition_tables(
         }
 
 
+
 def search_applicant_in_all_ratings(
     person_query: str,
 ) -> dict[str, Any]:
     """
-    Шукає вступника у всіх підключених рейтингах.
+    Шукає вступника у всіх таблицях загального конкурсу.
 
-    Пошук відбувається напряму по кожній таблиці загального
-    конкурсу, без повторного пошуку секції за повним заголовком.
+    Для кожної знайденої заяви готується повний аналіз,
+    подібний до аналізу за введеним балом.
     """
 
     query_tokens = parse_person_query(
@@ -1141,14 +1142,34 @@ def search_applicant_in_all_ratings(
         ):
             scanned_specialities += 1
 
-            applicants = parse_applicants(
+            all_applicants = parse_applicants(
                 section["table"]
             )
             scanned_applicants += len(
-                applicants
+                all_applicants
             )
 
-            for applicant in applicants:
+            budget_applicants = [
+                applicant
+                for applicant in all_applicants
+                if not applicant["contract_only"]
+            ]
+
+            contract_only_count = sum(
+                applicant["contract_only"]
+                for applicant in all_applicants
+            )
+
+            state_seats = section.get(
+                "state_seats"
+            )
+
+            budget_border = get_current_budget_border(
+                budget_applicants,
+                state_seats,
+            )
+
+            for applicant in all_applicants:
                 if not person_name_matches(
                     applicant["name"],
                     query_tokens,
@@ -1166,32 +1187,99 @@ def search_applicant_in_all_ratings(
 
                 seen.add(unique_key)
 
+                # Якщо це бюджетна заява, тимчасово прибираємо
+                # саму людину й додаємо назад через прогноз.
+                # Так вона не рахується двічі.
+                if applicant["contract_only"]:
+                    comparison_applicants = list(
+                        budget_applicants
+                    )
+                    place_label = (
+                        "Умовне бюджетне місце за балом"
+                    )
+                else:
+                    comparison_applicants = [
+                        item
+                        for item in budget_applicants
+                        if item is not applicant
+                    ]
+                    place_label = (
+                        "Місце серед бюджетних заяв за балом"
+                    )
+
+                forecast = calculate_forecast(
+                    comparison_applicants,
+                    applicant["score"],
+                )
+
+                nearby_applicants = get_nearby_applicants(
+                    comparison_applicants,
+                    applicant["score"],
+                    count=NEIGHBORS_COUNT,
+                )
+
+                priority_position = (
+                    calculate_person_priority_1_2_position(
+                        all_applicants,
+                        applicant,
+                    )
+                )
+
                 matches.append(
                     {
                         "full_name": section["full_name"],
+                        "name": applicant["name"],
+                        "score": applicant["score"],
                         "position": applicant[
                             "original_position"
                         ],
+                        "features": applicant.get(
+                            "features",
+                            "",
+                        ),
+                        "confirmed_place": applicant.get(
+                            "confirmed_place",
+                            "",
+                        ),
                         "priority": applicant.get(
                             "priority",
                             "",
                         ),
-                        "priority_1_2_position": (
-                            calculate_person_priority_1_2_position(
-                                applicants,
-                                applicant,
-                            )
-                        ),
-                        "state_seats": section[
-                            "state_seats"
+                        "contract_only": applicant[
+                            "contract_only"
                         ],
-                        "name": applicant["name"],
+                        "state_seats": state_seats,
+                        "all_applicants_count": len(
+                            all_applicants
+                        ),
+                        "budget_applicants_count": len(
+                            budget_applicants
+                        ),
+                        "contract_only_count": (
+                            contract_only_count
+                        ),
+                        "budget_border": budget_border,
+                        "nearby_applicants": (
+                            nearby_applicants
+                        ),
+                        "priority_1_2_position": (
+                            priority_position
+                        ),
+                        "place_label": place_label,
+                        "status": get_budget_status(
+                            forecast["best_place"],
+                            forecast["worst_place"],
+                            state_seats,
+                        ),
+                        **forecast,
                     }
                 )
 
     matches.sort(
         key=lambda item: (
-            normalize_text(item["full_name"]),
+            normalize_text(
+                item["full_name"]
+            ),
             item["position"],
         )
     )
@@ -1452,30 +1540,35 @@ def _pack_html_blocks(
 
 
 
+
 def format_person_search_results(
     analysis: dict[str, Any],
 ) -> list[str]:
     """
-    Формує короткий результат:
-    назва спеціальності та місце у загальному конкурсі.
+    Формує детальні картки знайдених заяв.
+
+    Виведення наближене до аналізу за балом.
     """
 
     query = _safe(
-        analysis.get("query", "")
+        analysis.get(
+            "query",
+            "",
+        )
     )
 
     if analysis.get("invalid_query"):
         return [
             "❌ Введіть щонайменше прізвище та ім’я.\n"
-            "Наприклад: <b>Савчук Роман</b>"
+            "Наприклад: <b>Скакун Ерік</b>"
         ]
 
     matches = analysis["matches"]
 
     header = (
-        "🔎 <b>Результати пошуку</b>\n"
-        f"Пошук: <b>{query}</b>\n\n"
-        "Враховано лише рейтинги "
+        "🔎 <b>Результати пошуку за ПІБ</b>\n"
+        f"Пошук: <b>{query}</b>\n"
+        "Враховано лише таблиці "
         "<b>«зарахування за конкурсом»</b>."
     )
 
@@ -1488,15 +1581,15 @@ def format_person_search_results(
         if scanned_applicants == 0:
             messages = [
                 f"{header}\n\n"
-                "❌ Бот не зміг прочитати жодної заявки "
-                "зі сторінки. Це технічна помилка парсера, "
-                "а не відсутність людини у рейтингах."
+                "❌ Бот не зміг прочитати жодної заявки. "
+                "Це технічна помилка парсера."
             ]
         else:
             messages = [
                 f"{header}\n\n"
                 "У підключених рейтингах збігів не знайдено."
             ]
+
     else:
         blocks: list[str] = []
 
@@ -1509,37 +1602,44 @@ def format_person_search_results(
                     match["full_name"]
                 )
             )
+            applicant_name = _safe(
+                match["name"]
+            )
 
             state_seats = match.get(
                 "state_seats"
             )
+            seats_text = (
+                str(state_seats)
+                if state_seats is not None
+                else "невідомо"
+            )
 
-            if state_seats is None:
-                place_text = (
-                    f"{match['position']} місце; "
-                    "кількість бюджетних місць невідома"
+            if (
+                match["best_place"]
+                == match["worst_place"]
+            ):
+                budget_place_text = str(
+                    match["best_place"]
                 )
             else:
-                place_text = (
-                    f"{match['position']} місце "
-                    f"з {state_seats} бюджетних"
+                budget_place_text = (
+                    f"{match['best_place']}"
+                    f"–{match['worst_place']}"
                 )
 
             priority_position = match[
                 "priority_1_2_position"
             ]
-            application_priority = _safe(
-                match.get("priority") or "не вказано"
-            )
-
-            priority_place_text = str(
-                priority_position["best_place"]
-            )
 
             if (
                 priority_position["best_place"]
-                != priority_position["worst_place"]
+                == priority_position["worst_place"]
             ):
+                priority_place_text = str(
+                    priority_position["best_place"]
+                )
+            else:
                 priority_place_text = (
                     f"{priority_position['best_place']}"
                     f"–{priority_position['worst_place']}"
@@ -1547,28 +1647,169 @@ def format_person_search_results(
 
             priority_label = (
                 "Місце серед заяв із пріоритетами 1–2"
-                if priority_position["person_is_included"]
+                if priority_position[
+                    "person_is_included"
+                ]
                 else (
                     "Умовне місце за балом серед заяв "
                     "із пріоритетами 1–2"
                 )
             )
 
+            application_priority = _safe(
+                match.get("priority")
+                or "не вказано"
+            )
+            features = _safe(
+                match.get("features")
+                or "немає"
+            )
+            confirmed_place = _safe(
+                match.get("confirmed_place")
+                or "не вказано"
+            )
+
+            application_status = (
+                "лише контракт — ПЛ"
+                if match["contract_only"]
+                else "бере участь у бюджетному конкурсі"
+            )
+
+            lines = [
+                f"🎓 <b>{number}. {speciality_name}</b>",
+                "",
+                f"ПІБ: <b>{applicant_name}</b>",
+                (
+                    "Рейтинговий бал: "
+                    f"<b>{match['score']:.3f}</b>"
+                ),
+                (
+                    "Місце у таблиці загального конкурсу: "
+                    f"<b>{match['position']} "
+                    f"з {seats_text} бюджетних місць</b>"
+                ),
+                (
+                    f"{match['place_label']}: "
+                    f"<b>{budget_place_text} "
+                    f"з {seats_text}</b>"
+                ),
+                (
+                    f"{priority_label}: "
+                    f"<b>{priority_place_text} "
+                    f"із {priority_position['total_count']}</b>"
+                ),
+                "",
+                (
+                    "Статус заяви: "
+                    f"<b>{application_status}</b>"
+                ),
+                (
+                    "Пріоритет заяви: "
+                    f"<b>{application_priority}</b>"
+                ),
+                (
+                    "Пільги та особливості: "
+                    f"<b>{features}</b>"
+                ),
+                (
+                    "ПМН: "
+                    f"<b>{confirmed_place}</b>"
+                ),
+                "",
+                (
+                    "Усього заяв у таблиці: "
+                    f"<b>{match['all_applicants_count']}</b>"
+                ),
+                (
+                    "Беруть участь у конкурсі на бюджет: "
+                    f"<b>{match['budget_applicants_count']}</b>"
+                ),
+                (
+                    "Заяв лише на контракт, ПЛ: "
+                    f"<b>{match['contract_only_count']}</b>"
+                ),
+                "",
+                "<b>Найближчі результати за балом</b>",
+            ]
+
+            nearby = match[
+                "nearby_applicants"
+            ]
+            higher = nearby["higher"]
+            lower = nearby["lower"]
+
+            if higher:
+                lines.append(
+                    "🔼 Вище:"
+                )
+
+                for applicant in higher:
+                    lines.append(
+                        f"• {applicant['forecast_position']} місце — "
+                        f"{applicant['score']:.3f} — "
+                        f"{_safe(applicant['name'])}"
+                    )
+            else:
+                lines.append(
+                    "🔼 Вище немає вступників."
+                )
+
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"➡️ <b>{budget_place_text} місце — "
+                        f"{match['score']:.3f} — "
+                        f"{applicant_name}</b>"
+                    ),
+                    "",
+                ]
+            )
+
+            if lower:
+                lines.append(
+                    "🔽 Нижче:"
+                )
+
+                for applicant in lower:
+                    lines.append(
+                        f"• {applicant['forecast_position']} місце — "
+                        f"{applicant['score']:.3f} — "
+                        f"{_safe(applicant['name'])}"
+                    )
+            else:
+                lines.append(
+                    "🔽 Нижче немає вступників."
+                )
+
+            lines.append("")
+
+            if match["budget_border"] is None:
+                lines.append(
+                    "Поточна межа бюджету ще не визначена: "
+                    "заяв менше, ніж бюджетних місць."
+                )
+            else:
+                lines.append(
+                    "Поточний бал на межі бюджету: "
+                    f"<b>{match['budget_border']:.3f}</b>"
+                )
+
+            lines.extend(
+                [
+                    "",
+                    f"<b>Висновок:</b> {match['status']}",
+                ]
+            )
+
             blocks.append(
-                f"<b>{number}. {speciality_name}</b>\n"
-                f"Місце в рейтингу: "
-                f"<b>{place_text}</b>\n"
-                f"Пріоритет заяви: "
-                f"<b>{application_priority}</b>\n"
-                f"{priority_label}: "
-                f"<b>{priority_place_text} "
-                f"із {priority_position['total_count']}</b>"
+                "\n".join(lines)
             )
 
         messages = _pack_html_blocks(
             (
                 f"{header}\n"
-                f"Знайдено рейтингів: "
+                f"Знайдено заяв: "
                 f"<b>{len(matches)}</b>"
             ),
             blocks,
@@ -1576,11 +1817,14 @@ def format_person_search_results(
 
     if analysis["errors"]:
         messages.append(
-            "⚠️ Не вдалося перевірити деякі сторінки."
+            "⚠️ <b>Не вдалося перевірити деякі сторінки</b>\n"
+            + "\n".join(
+                f"• {_safe(error)}"
+                for error in analysis["errors"]
+            )
         )
 
     return messages
-
 
 
 def format_all_budget_specialities(
